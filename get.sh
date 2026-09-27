@@ -8,9 +8,9 @@ REPO="WiNloSt/save-sync"
 REF="${SAVESYNC_REF:-}"
 if [ -z "$REF" ]; then
   # pin the exact commit so the installed version is known (for self-update)
-  REF="$(curl -fsSL "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null \
-         | sed -n 's/^  "sha": "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)" || true
-  [ -n "$REF" ] || REF=main
+  REF="$(curl -fsSL -H "Accept: application/vnd.github.sha" \
+         "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null)" || true
+  printf '%s' "$REF" | grep -qE '^[0-9a-f]{40}$' || REF=main
 fi
 DEST="$HOME/.local/share/save-sync/src"
 TMP="$(mktemp -d)"
