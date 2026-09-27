@@ -507,7 +507,10 @@ def cmd_devices(args):
 
 
 def rclone(env, *args, check=True):
-    cmd = [str(RCLONE), "--config", "/dev/null", "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
+    # --s3-disable-http2 / --multi-thread-streams 0: downloads from R2 over
+    # HTTP/2 stalled at random offsets (12.9 MB: stuck >5 min; fixed: 0.4 s).
+    cmd = [str(RCLONE), "--config", "/dev/null", "--s3-disable-http2", "--multi-thread-streams", "0",
+           "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
            "--low-level-retries", "2", "--transfers", "8", "--checkers", "16", *args]
     r = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
     if check and r.returncode != 0:

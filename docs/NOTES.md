@@ -81,6 +81,10 @@
   device's own history.
 
 ## Cloud (R2 + crypt + Worker), 2026-09-27
+- **Downloads from R2 stalled** at random points (a 12.9 MB file stuck at 9-10 MiB for minutes,
+  on both PC and Deck, while uploads and 42 MB/s speed tests were fine). This is rclone's HTTP/2
+  to R2: `--s3-disable-http2` (plus `--multi-thread-streams 0`) gives 6/6 downloads at about 0.4 s.
+  It was not the Wi-Fi, not the Deck, and not the encryption layer (raw objects stalled too).
 - `rclone cat` of a missing object on R2 exits 0 with empty output (the local stand-in errored).
   An empty head is read as "nothing in the cloud yet".
 - The rclone remote is defined only by env vars (`RCLONE_CONFIG_R2_*`, `RCLONE_CONFIG_SS_*`),
