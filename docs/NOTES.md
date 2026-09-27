@@ -56,6 +56,16 @@
 - `wrap` isn't used. `savesync run` launches the game itself so it can forward SIGTERM, detect
   the save dir on first play, and later own the cloud sync direction.
 
+## Cloud (R2 + crypt + Worker), 2026-09-27
+- `rclone cat` of a missing object on R2 exits 0 with empty output (the local stand-in errored).
+  An empty head is read as "nothing in the cloud yet".
+- The rclone remote is defined only by env vars (`RCLONE_CONFIG_R2_*`, `RCLONE_CONFIG_SS_*`),
+  built from the Worker's `/keys` answer per sync. No rclone.conf, no keys on disk.
+- `tests/two-device-sim.sh`: 10/10 against the stand-in AND (`CLOUD=worker`) against the real
+  Worker + R2 + crypt.
+- Pasted secrets can carry stray whitespace (a leading space in the Google Client ID broke
+  sourcing .env). Values are trimmed on save.
+
 ## Tested
 - 2026-09-27, through real Heroic, never-seen fake game: the before-hook registered it, the
   first play session detected `…/config/FakeCo/FakeGame` (the `.log` was filtered), and the
