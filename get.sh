@@ -13,4 +13,6 @@ curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" | tar -
 rm -rf "$DEST"; mkdir -p "$(dirname "$DEST")"
 mv "$TMP"/save-sync-* "$DEST"
 # stdin is the curl pipe; give the installer the terminal for its questions
-if [ -r /dev/tty ]; then exec "$DEST/install.sh" "$@" < /dev/tty; else exec "$DEST/install.sh" "$@"; fi
+# (-r /dev/tty is true even with no controlling terminal, so actually try to open it)
+if (exec </dev/tty) 2>/dev/null; then exec "$DEST/install.sh" "$@" < /dev/tty; fi
+exec "$DEST/install.sh" "$@"
