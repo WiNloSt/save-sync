@@ -73,6 +73,13 @@
     hides everything.
 - Regression test: `tests/detection-test.sh`.
 
+## Size (2026-09-27): a fresh device downloaded 192 MB for 13 MB of saves
+- Each backup held `game/saves` (13 MB) plus `~/.renpy/<dir>` (16 MB, the partial, older copy),
+  about 28 MB with screenshots that don't compress, and the pull fetched all 9 versions.
+- Now: Ren'Py backs up `game/saves` only (`~/.renpy` only when game/saves has no saves);
+  retention is 5 versions; a pull downloads only the cloud's newest backup and appends it to the
+  device's own history.
+
 ## Cloud (R2 + crypt + Worker), 2026-09-27
 - `rclone cat` of a missing object on R2 exits 0 with empty output (the local stand-in errored).
   An empty head is read as "nothing in the cloud yet".

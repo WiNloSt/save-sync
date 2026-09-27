@@ -56,7 +56,7 @@ HEROIC_GAMESCONFIG = HEROIC_CFG / "GamesConfig"
 HOOK_DIR = HOME / "Games/Heroic/save-sync"          # inside Heroic's sandbox grant
 HOOK = HOOK_DIR / "hook.sh"
 TOKENS_GAME = "Ren'Py security tokens"
-RETENTION_FULL = 10
+RETENTION_FULL = 5
 RCLONE = APP_HOME / "bin/rclone"
 SETTINGS = CFG_HOME / "settings.json"
 CONFLICTS = APP_HOME / "conflicts"
@@ -177,14 +177,18 @@ def rule_paths(g):
     d = Path(g["game_dir"]) if g.get("game_dir") else None
     if is_renpy(d):
         g["engine"] = "renpy"
-        # game/saves is the copy Ren'Py keeps complete; ~/.renpy/<dir> can lag
-        # far behind (verified on a real game). Back up both.
-        paths = [str(d / "game/saves")]
+        # game/saves is the copy Ren'Py keeps complete; ~/.renpy/<dir> lags far
+        # behind and would double every backup. Use ~/.renpy only for a game
+        # whose game/saves has no saves (e.g. a read-only install).
+        saves = d / "game/saves"
         rd = g.get("renpy_dir") or match_renpy_dir(d)
         if rd:
             g["renpy_dir"] = rd
-            paths.append(str(RENPY_HOME / rd))
-        return paths
+        if saves.is_dir() and any(saves.glob("*.save")):
+            return [str(saves)]
+        if rd and any((RENPY_HOME / rd).glob("*.save")):
+            return [str(RENPY_HOME / rd)]
+        return [str(saves)]
     return []
 
 
@@ -503,7 +507,7 @@ def cmd_devices(args):
 
 
 def rclone(env, *args, check=True):
-    cmd = [str(RCLONE), "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
+    cmd = [str(RCLONE), "--config", "/dev/null", "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
            "--low-level-retries", "2", "--transfers", "8", "--checkers", "16", *args]
     r = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
     if check and r.returncode != 0:
@@ -591,11 +595,38 @@ def quarantine(title, g, why, env=None):
     return dest
 
 
+def split_mapping(text):
+    """Ludusavi mapping.yaml -> (header, [backup entry blocks]) (full backups only)."""
+    parts = re.split(r"(?m)^(?=  - name: )", text)
+    return parts[0], parts[1:]
+
+
+def entry_name(block):
+    return re.match(r"  - name: (.+)", block).group(1).strip().strip('"')
+
+
 def pull(env, title, g, head):
-    """Cloud -> local backups -> live saves."""
+    """Cloud -> local backups -> live saves. Downloads only the cloud's newest
+    backup and appends it to this device's own history (a fresh device used to
+    fetch the whole history: 192 MB for 13 MB of saves). Ludusavi trims the
+    history back to RETENTION_FULL on the next backup."""
     bdir = backup_dir(title)
     bdir.mkdir(parents=True, exist_ok=True)
-    rclone(env, "sync", f"ss:games/{title}", str(bdir))
+    cloud_header, cloud_entries = split_mapping(
+        rclone(env, "cat", f"ss:games/{title}/mapping.yaml").stdout)
+    if not cloud_entries:
+        raise RuntimeError("cloud backup has no entries")
+    newest = cloud_entries[-1]
+    latest = entry_name(newest)
+    if not (bdir / latest).exists():
+        rclone(env, "copyto", f"ss:games/{title}/{latest}", str(bdir / latest))
+    local_map = bdir / "mapping.yaml"
+    if local_map.exists():
+        header, entries = split_mapping(local_map.read_text())
+        entries = [e for e in entries if (bdir / entry_name(e)).exists() and entry_name(e) != latest]
+    else:
+        header, entries = cloud_header, []
+    local_map.write_text(header + "".join(entries) + newest)
     redirects = []
     old, new = head.get("game_dir"), g.get("game_dir")
     if old and new and old != new:
@@ -855,6 +886,8 @@ def hook_before(app, title, exe, runner, prefix):
         old_dir = g.get("game_dir")
         new_dir = str(Path(exe).parent) if exe else old_dir
         g.update({"title": title, "exec": exe, "prefix": prefix, "game_dir": new_dir})
+        if g.get("engine") == "renpy" and not g.get("confirmed"):
+            g["save_paths"] = rule_paths(g)
         if old_dir and new_dir != old_dir:
             # Game updated to a new folder (SpiderMan-1.0-pc -> SpiderMan-1.1-pc): save
             # folders inside the old game folder move with it.
