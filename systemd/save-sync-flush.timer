@@ -1,5 +1,5 @@
 [Unit]
-Description=save-sync: retry pending uploads every 15 minutes
+Description=save-sync: retry pending uploads every 15 minutes, check updates daily
 
 [Timer]
 OnBootSec=2min

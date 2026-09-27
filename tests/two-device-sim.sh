@@ -37,6 +37,9 @@ game() { ss hook before "app-$DEV" "Sim Game" "$H/games/$GAMEDIR/game.sh" sidelo
          [ -n "${WRITE:-}" ] && echo "$WRITE" > "$H/games/$GAMEDIR/saves/slot1.sav"; \
          ss hook after "app-$DEV" "Sim Game" "$H/games/$GAMEDIR/game.sh" sideload ""; }
 play() {   # play A <folder> <content>   (content "" = launch without saving)
+  # Ludusavi names backups by the second; two simulated sessions in the same
+  # second would reuse a file name and rclone would skip the "unchanged" file.
+  sleep 1
   DEV=$1 GAMEDIR=$2 WRITE=$3 on "$1" bash -c "$(declare -f ss game); REPO='$REPO' H='$H' DEV='$1' GAMEDIR='$2' WRITE='$3' game"
 }
 found() {  # found <text> <dir> : any file (incl. inside backup zips) containing text
@@ -99,6 +102,16 @@ mkdir -p "$X/dev-B/games/G-1.1/saves"
 play A G-1.0 v6
 play B G-1.1 ""
 [ "$(slot B G-1.1)" = v6 ] && ok "v6 restored into G-1.1" || bad "G-1.1 has $(slot B G-1.1)"
+
+echo "8. conflict on a FRESH device, 'decide later' → launches with its own save, nothing pushed, asks again"
+mkdev C G-1.0
+echo "c-own" > "$X/dev-C/games/G-1.0/saves/slot1.sav"
+SAVESYNC_CONFLICT_CHOICE=later play C G-1.0 ""
+[ "$(slot C G-1.0)" = c-own ] && ok "C kept its own save" || bad "C has $(slot C G-1.0)"
+grep -q conflict "$X/dev-C/.local/share/save-sync/state/Sim Game.pending" 2>/dev/null && ok "conflict remembered" || bad "no pending conflict"
+grep -q "ERROR" "$X/dev-C/.local/share/save-sync/logs/savesync.log" && bad "hook errored" || ok "no hook error"
+play B G-1.1 ""
+[ "$(slot B G-1.1)" = v6 ] && ok "cloud untouched by C (B still v6)" || bad "B has $(slot B G-1.1)"
 
 echo; echo "passed $pass, failed $fail   (sandbox: $X)"
 [ "$fail" = 0 ]

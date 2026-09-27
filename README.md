@@ -22,7 +22,9 @@ Then:
    folder is found on its first launch.
 
 It installs the latest `main` branch into your home folder, so SteamOS updates don't touch it.
-Re-running the same line updates or repairs it.
+It **updates itself**: at startup and once a day it checks GitHub and installs any new version
+(never mid-game). Turn that off with `"auto_update": false` in `~/.config/save-sync/settings.json`.
+Re-running the same line also updates or repairs it.
 
 ## Everyday commands
 
@@ -46,6 +48,11 @@ savesync status
 ```
 Is this device signed in? (Re-running the installer never asks you to sign in again while the
 sign-in is valid.)
+
+```sh
+savesync update
+```
+Update now instead of waiting for the daily check.
 
 ```sh
 savesync devices

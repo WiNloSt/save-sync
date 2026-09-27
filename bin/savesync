@@ -12,6 +12,7 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
   savesync sync [--pending] [<game>…]  sync now / push what was saved while offline
   savesync login [--force]           sign this device in (Google, once; skipped if already valid)
   savesync status                    is this device signed in?
+  savesync update                    install the latest version now (the timer does it daily)
   savesync devices [--revoke <id>]   signed-in devices; sign one out
   savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
   savesync gen-config                rewrite the Ludusavi config from the registry
@@ -503,7 +504,7 @@ def cmd_devices(args):
 
 def rclone(env, *args, check=True):
     cmd = [str(RCLONE), "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
-           "--low-level-retries", "2", *args]
+           "--low-level-retries", "2", "--transfers", "8", "--checkers", "16", *args]
     r = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
     if check and r.returncode != 0:
         msg = r.stderr.strip().splitlines()[-1:] or [""]
@@ -560,6 +561,7 @@ def set_base(title, fp):
 
 
 def pending_file(title):
+    STATE.mkdir(parents=True, exist_ok=True)   # fresh device: nothing has created it yet
     return STATE / f"{title}.pending"
 
 
@@ -615,7 +617,7 @@ def push(env, title, g, fp):
         return
     rclone(env, "sync", str(bdir), f"ss:games/{title}")
     put_head(env, title, {"fp": fp, "device": DEVICE, "time": time.time(),
-                          "game_dir": g.get("game_dir")})
+                          "save_time": newest_local_mtime(g), "game_dir": g.get("game_dir")})
     log(f"sync {title}: pushed to cloud")
 
 
@@ -633,11 +635,16 @@ def ask_conflict(title, head, local_fp, g=None):
     forced = os.environ.get("SAVESYNC_CONFLICT_CHOICE")
     if forced:
         return forced
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(head.get("time", 0)))
+    fmt = lambda t: time.strftime("%a %d %b %Y, %H:%M", time.localtime(t)) if t else "unknown"
+    cloud_t = head.get("save_time") or head.get("time", 0)   # when it was saved, not uploaded
+    local_t = newest_local_mtime(g or {})
+    newer = "cloud" if cloud_t > local_t else "this device"
     text = (f"{title}: the cloud and this device both have saves the other hasn't seen.\n\n"
-            f"Cloud: saved on {head.get('device')} at {when}\n"
-            f"This device: {DEVICE}\n\n"
-            f"Whichever you don't pick is kept in\n~/.local/share/save-sync/conflicts/")
+            f"Cloud save:  {fmt(cloud_t)}  (from {head.get('device', '?')})\n"
+            f"This device: {fmt(local_t)}  ({DEVICE})\n\n"
+            f"Newer: {newer}.\n\n"
+            f"Whichever you don't pick is kept in\n~/.local/share/save-sync/conflicts/\n"
+            f"'Decide later' plays this device's save and asks again next launch.")
     try:
         r = subprocess.run(["kdialog", "--title", f"save-sync: {title}", "--warningyesnocancel", text,
                             "--yes-label", "Use cloud save", "--no-label", "Use this device's save",
@@ -646,7 +653,7 @@ def ask_conflict(title, head, local_fp, g=None):
     except Exception as e:
         log(f"sync {title}: conflict dialog failed ({e!r}); newest wins")
         # both sides are quarantined before anything is overwritten
-        return "cloud" if head.get("time", 0) >= newest_local_mtime(g or {}) else "local"
+        return "cloud" if (head.get("save_time") or head.get("time", 0)) >= newest_local_mtime(g or {}) else "local"
 
 
 def sync_before(g):
@@ -740,6 +747,58 @@ def sync_after(g):
         pending_file(title).write_text("push")
         notify(f"{title}: saved locally, not synced", "Offline; it will upload when you're back online.")
         log(f"sync {title}: offline after play ({e}); pending")
+
+
+REPO = "WiNloSt/save-sync"
+SRC = APP_HOME / "src"
+UPDATE_EVERY = 24 * 3600
+
+
+def cmd_update(args=None):
+    """Install the latest save-sync from GitHub if it's newer. `--auto`: at most
+    once a day, quietly, and only if settings allow (the timer calls this)."""
+    auto = "--auto" in (args or [])
+    stamp = STATE / "update-check"
+    if auto:
+        if settings().get("auto_update", True) is False:
+            return
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < UPDATE_EVERY:
+            return
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://api.github.com/repos/{REPO}/commits/main",
+                headers={"user-agent": "save-sync", "accept": "application/vnd.github.sha"}),
+                timeout=15) as r:
+            latest = r.read().decode().strip()
+    except Exception as e:
+        log(f"update: check failed ({e})")
+        if not auto:
+            say(f"Couldn't check for updates: {e}")
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    current = (SRC / ".commit").read_text().strip() if (SRC / ".commit").exists() else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", latest) or latest == current:
+        if not auto:
+            say(f"Up to date ({current[:7] or 'unknown'}).")
+        return
+    if subprocess.run(["pgrep", "-f", "savesync hook"], capture_output=True).returncode == 0:
+        log("update: a game hook is running; will retry later")
+        stamp.unlink(missing_ok=True)
+        return
+    log(f"update: {current[:7] or '?'} -> {latest[:7]}")
+    r = subprocess.run(["sh", "-c", f"curl -fsSL https://raw.githubusercontent.com/{REPO}/{latest}/get.sh | sh"],
+                       env={**os.environ, "SAVESYNC_REF": latest, "NONINTERACTIVE": "1"},
+                       capture_output=True, text=True, timeout=900)
+    if r.returncode == 0:
+        log(f"update: installed {latest[:7]}")
+        notify("save-sync updated", f"Now at {latest[:7]}.")
+        if not auto:
+            say(f"Updated to {latest[:7]}.")
+    else:
+        log(f"update: FAILED: {(r.stderr or r.stdout)[-500:]}")
+        if not auto:
+            say("Update failed; see ~/.local/share/save-sync/logs/savesync.log")
 
 
 def cmd_sync(args):
@@ -1082,7 +1141,7 @@ COMMANDS = {
     "list": cmd_list, "paths": cmd_paths, "backup": cmd_backup,
     "setup-heroic": cmd_setup_heroic, "unhook-heroic": cmd_unhook_heroic,
     "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
-    "login": cmd_login, "devices": cmd_devices, "status": cmd_status,
+    "login": cmd_login, "devices": cmd_devices, "status": cmd_status, "update": cmd_update,
 }
 
 if __name__ == "__main__":

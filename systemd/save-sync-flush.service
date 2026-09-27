@@ -1,6 +1,7 @@
 [Unit]
-Description=save-sync: upload saves made while offline
+Description=save-sync: upload saves made while offline; daily self-update check
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/savesync sync --pending
+ExecStart=-%h/.local/bin/savesync update --auto
