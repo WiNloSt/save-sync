@@ -1,0 +1,12 @@
+name = "save-sync"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true          # auth is in the code, so the workers.dev address is fine
+
+[vars]
+R2_BUCKET = "save-sync"
+
+# id filled in by deploy.sh (`wrangler kv namespace create`); not a secret
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "REPLACE_ON_FIRST_DEPLOY"

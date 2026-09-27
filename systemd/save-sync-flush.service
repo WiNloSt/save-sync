@@ -1,0 +1,6 @@
+[Unit]
+Description=save-sync: upload saves made while offline
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/savesync sync --pending

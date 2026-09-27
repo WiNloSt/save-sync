@@ -1,0 +1,178 @@
+# savesync — Steam-Cloud-style saves for non-Steam games
+
+## Context
+Native-Linux non-Steam games (Ren'Py/itch titles in `~/games`, more later) have no cloud saves.
+Goal: this machine, the Steam Deck and any future SteamOS PC share saves **automatically on game
+launch and exit**, with a Steam-like "keep cloud or keep local?" prompt on conflict. It has to work
+anywhere with internet (e.g. hotel Wi-Fi) with nothing to toggle, and in both Gaming Mode and
+Desktop Mode. No secret files get copied between devices: each device authenticates with a
+Google sign-in (identity only). It must survive SteamOS updates. One `./install.sh` per device, kept in a repo
+like steamos-line.
+
+## Decisions (from the interview)
+| Topic | Decision |
+|---|---|
+| Games | Native Linux (Ren'Py/itch); extensible |
+| Devices | This PC + Deck + future SteamOS PCs |
+| Trigger | Pull on launch, push on exit |
+| Conflict | Prompt: keep cloud or keep local (loser kept as a local version) |
+| Offline | Warn, launch anyway, sync later |
+| Launcher | **Heroic** as the single hub (1 Steam shortcut). Per-game tiles later via Heroic's "Add to Steam" use the same path |
+| Storage | **Cloudflare R2** bucket `savesync` (rclone S3 backend; free 10 GB, no egress fees) |
+| Encryption | **rclone crypt** over the R2 remote |
+| Secrets | **Google sign-in per device (identity only).** A Cloudflare Worker verifies the Google ID token and releases the R2 credentials plus the crypt key. Nothing gets copied between devices |
+| Engine | **Ludusavi** (standalone binary) for save discovery, versioned backups, `wrap`, rclone. Custom glue where it falls short |
+
+## Login model (like Steam's "remember me")
+You sign in with Google once per device, in Desktop Mode. Google is only used at that moment.
+After that the Worker issues its **own session token**, which works like Steam's remembered login:
+- It's stored on the device (0600). Every sync presents it to the Worker, which answers with
+  short-lived R2 creds + the crypt key. rclone uses them in memory for that one run and they're
+  never written to disk.
+- Sliding expiry: 90 days, extended on every sync. A device unused for 90 days has to sign in again.
+- It's revocable per device: the Worker keeps a list of sessions in KV, and `savesync devices`
+  lists them and can revoke one.
+- Sync needs internet anyway. If the Worker is unreachable, it's handled like being offline
+  (pending marker, retry later).
+Because Google isn't involved after sign-in, there's no Google refresh token to keep valid and
+no 7-day testing-mode expiry to worry about.
+
+## Adding games & picking save folders (UX, decided 2026-09-27)
+- **Games are added in Heroic** (its own Add Game button). **Heroic's global Before/After
+  launch scripts** call save-sync for every game, so there's no per-game setup and no separate
+  "add game" in save-sync.
+- **First launch of an unknown game** registers it. Save folders come from engine rules
+  (Ren'Py now; Unity, Godot, RPG Maker and GameMaker next), then from watching which files the
+  first play session writes. They're marked *not confirmed*.
+- **Confirm / repick, any time.** Phase 1b adds a dialog on the first exit ("These look like
+  <Game>'s saves: Keep / Change / Add another / Detect again"). Today it's a notification plus
+  `savesync paths`.
+- **GUI (phase 1b):** a Save Sync manager window (tkinter, already on the system) listing
+  games with Change save folder / Restore a version / Sync now. It's added to Heroic as a tile,
+  so it's reachable in Gaming Mode too. The CLI stays underneath.
+
+## Credentials & scope (decided 2026-09-27)
+| Credential | Lives | Scope / limit |
+|---|---|---|
+| R2 key (Access Key ID + Secret) | Worker secret only | Object Read & Write on bucket `save-sync` only |
+| Deploy token `save-sync-deploy` | this PC, 0600, outside the repo | Workers Scripts Edit, Workers KV Edit, Account Settings Read; **expires 2026-10-04**; delete after the two-machine test. Only needed for deploys and secret changes. |
+| Google OAuth **Web** client (ID + secret) | Worker secret only | scopes openid + email; Testing mode; one test user (you); redirect only `https://save-sync.<sub>.workers.dev/auth/callback` |
+| Crypt key (rclone crypt) | Worker secret + user's password manager | never on device disk |
+| Device session | device, 0600 | 90-day sliding, hashed in KV, revocable, sign-in rate-limited |
+The Worker has no Cloudflare API token; KV is bound directly. Per-sync temporary R2 creds were
+dropped, because minting them needs an account-wide R2 admin token.
+
+Sign-in flow: the device opens `/auth/start?device=…` in the browser. The Worker sends you to
+Google, gets the reply at `/auth/callback`, checks the ID token (issuer, audience, expiry,
+email_verified, email == ALLOWED_EMAIL (a Worker secret), then `sub` pinned on first sign-in), and issues a
+session that the device picks up by polling. The Google client secret never leaves the Worker.
+
+Distribution: **public** repo `WiNloSt/save-sync`, no secrets ever. Install on a new device:
+`curl -fsSL https://raw.githubusercontent.com/WiNloSt/save-sync/main/get.sh | sh`
+
+## Architecture
+```
+Gaming/Desktop Mode ─► Heroic (Flatpak, 1 Steam shortcut) ─► any game
+                         ├─ global Before script ─► flatpak-spawn --host savesync hook before
+                         └─ global After script  ─► flatpak-spawn --host savesync hook after
+                                   1. online?  no → notify "offline", mark pending, launch
+                                   2. glue owns direction: 3-way check (base / local / cloud)
+                                      → auto-pull | auto-push | nothing | CONFLICT
+                                      CONFLICT → quarantine BOTH sides first, then prompt
+                                   3. ludusavi wrap --no-cloud-sync (restore → game → backup)
+                                   4. push (rclone crypt → R2); clear pending
+Enrollment (once per device, Desktop Mode):
+  savesync login → browser Google sign-in (scopes: openid email only)
+    → ID token → Cloudflare Worker (checks aud + sub == you)
+    → Worker returns a session token (90-day sliding) → stored 0600 (the "remembered login")
+Every sync: session token → Worker → temp R2 creds + crypt key → rclone env vars (memory only)
+```
+
+## Why custom glue on top of Ludusavi (the "extend it" part)
+1. **Glue owns sync direction (3-way).** Ludusavi compares local and cloud two ways, so a device
+   that is merely *behind* would likely get a prompt every time you switch devices. Steam doesn't
+   do that. Glue records the last-synced state per game and only prompts when **both** sides
+   changed; otherwise it auto-pulls or auto-pushes with `ludusavi cloud download/upload`, then
+   runs `wrap --no-cloud-sync`. Spike (a) only decides whether this can be simplified.
+1b. **Conflict loser is really kept.** A download or upload is an rclone *sync*, so it deletes
+   the losing side's files. Before resolving in either direction, copy the live saves and the
+   local backup dir to `~/.local/share/savesync/conflicts/<game>/<ts>/`.
+1c. **Gaming Mode prompt.** The prompt has to show up over gamescope *and* work with the
+   controller (spike e). If it can't: prompt in Desktop Mode only. In Gaming Mode, resolve
+   newest-wins with both sides quarantined, and show a notification saying so.
+2. **Offline.** Detect with a quick rclone reachability check, run `wrap --no-cloud-sync`, write
+   a pending marker. A systemd **user** timer (every 15 min) plus the next launch flush pending
+   pushes once the network is back.
+3. **Overlay-quit safety.** Steam kills Heroic's process tree when you quit from the overlay,
+   and the After script runs inside Heroic, so that backup is lost. The protection is the
+   phase-2 before-hook: it compares live saves with the last sync and never restores an older
+   backup over newer live data (asks instead).
+4. **Heroic sandbox (verified by spike).** Games run inside Heroic's sandbox. The override
+   grants `talk-name=org.freedesktop.Flatpak` (hooks → host), `~/games` and `~/.renpy`. Other
+   engines save into Heroic's private HOME (`~/.var/app/com.heroicgameslauncher.hgl/…`); that's
+   fine, because detection watches there and every device launches through Heroic.
+5. **Ren'Py save paths (checked on this PC).** `<game>/game/saves/` is the complete copy;
+   `~/.renpy/<save_dir>/` can lag far behind. Back up both. `<save_dir>` isn't the game's name
+   (one real game uses Ren'Py's default `Testgame-<id>`) and is matched by identical save contents.
+   **Also sync `~/.renpy/tokens/`.** Ren'Py 8 signs saves with a per-device key and warns about
+   saves made on another device. Sharing the tokens dir avoids that dialog on every device switch.
+6. **Quoting.** game folders can contain apostrophes (`It's_A_Game-1.0-pc`), so the hook and
+   Ludusavi globs (bracket-escaping) must handle odd names; it's a test case.
+
+## Repo: `~/workspace/save-sync`
+```
+install.sh              # idempotent; same on PC and Deck
+bin/savesync            # CLI (python3 stdlib): hook | list | paths | backup | setup-heroic | doctor
+                        #   later: login | sync | gui
+lib/common.sh           # installer helpers
+versions.env            # pinned ludusavi + rclone with sha256
+docs/                   # PLAN, NOTES, spikes/
+worker/                 # (phase 4) Cloudflare Worker: Google sign-in → session → R2 creds + crypt key
+systemd/                # (phase 2) savesync-flush.{service,timer} (user)
+```
+Install does the following (all in `~`, so SteamOS updates don't touch it):
+- Pinned ludusavi + rclone into `~/.local/share/save-sync/bin`, and `savesync` into `~/.local/bin`.
+- Heroic Flatpak override (host talk, `~/games`, `~/.renpy`).
+- Heroic's global Before/After scripts point at `~/Games/Heroic/save-sync/hook.sh`, and empty
+  per-game paths are patched (Heroic must be closed; the installer offers to close it).
+- The Ludusavi config is generated from the registry, and a baseline backup is taken.
+- Later: enable the user timer, `savesync login`.
+
+A `savesync doctor` command re-checks everything after an OS update and repairs it by re-running
+install. You only need it if an update wipes something outside `~`, which none of this uses.
+
+## Phases
+0. **Spikes (before building):**
+   - (a) With two local backup dirs and one remote, check whether Ludusavi prompts when a device is
+     merely behind. This decides whether we need the 3-way glue.
+   - (b) Gaming Mode overlay "Exit Game": does a host-side process survive, and does
+     flatpak-spawn forward SIGTERM?
+   - (c) Heroic v2.22.3 sideload config format (library.json) for a native script target.
+   - (e) Gaming Mode: does a host-spawned dialog (Ludusavi `--gui` / zenity / kdialog) render over
+     gamescope and accept controller input? If not → fallback in 1c.
+   - (f) rclone S3 backend against R2 (provider=Cloudflare, endpoint, `no_check_bucket`) with
+     Ludusavi's default args `--fast-list --ignore-checksum` over a crypt remote.
+   - (d) Can the Worker mint R2 temporary access credentials (Cloudflare API) for each sync?
+     Fallback: the Worker returns the long-lived R2 token, still memory-only on the device.
+
+     Google sign-in is only needed for identity, so there's no Drive scope and no 7-day
+     testing-mode token problem.
+1. Engine: Ludusavi + rclone crypt over R2, manual `savesync sync` end-to-end on this PC.
+2. Wrap + 3-way state + offline pending + flush timer.
+3. Heroic integration: override, sideload, wrapper, Ren'Py save-dir detection.
+4. R2 bucket + Worker (wrangler deploy; secrets: R2 creds, crypt key; allowlist = your Google `sub`) + `savesync login`.
+5. Deck enrollment with the same install.sh; README; memory entry.
+
+## Verification
+- On the PC, play Game A and save, then quit normally. An encrypted object appears in the R2 bucket.
+- On the Deck in Gaming Mode, launch A from Heroic. It auto-pulls with no prompt and loads the PC's save.
+- Save on both devices offline, then go online. Launching shows the keep cloud / keep local prompt
+  (Desktop Mode) or the newest-wins notification (Gaming Mode, if 1c applies). The losing save is
+  in `conflicts/<game>/<ts>/` and restores correctly.
+- Load a save made on the PC on the Deck: no Ren'Py "different device" warning.
+- Airplane mode: the game launches with an "offline" notice. After reconnecting, the timer pushes
+  within 15 min.
+- Overlay-quit in Gaming Mode: the save is either pushed, or protected by `--ask-downgrade` on the
+  next launch.
+- Signing in with a different Google account gets a 403 from the Worker. `savesync doctor` is clean
+  after a reboot.

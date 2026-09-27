@@ -1,0 +1,1012 @@
+#!/usr/bin/python3
+"""savesync — Steam-Cloud-style saves for non-Steam games (host side).
+
+Heroic runs a global Before/After launch hook for every game; the hook calls
+`savesync hook before|after …` on the host. Phase 1: versioned local backups
+on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
+
+  savesync list                      games, their save folders, confirmed or not
+  savesync paths <game> [--set P… | --add P | --detect]
+                                     show / repick a game's save folders
+  savesync backup [<game>…]          back up now (default: all)
+  savesync sync [--pending] [<game>…]  sync now / push what was saved while offline
+  savesync login                     sign this device in (Google, once; opens the browser)
+  savesync devices [--revoke <id>]   signed-in devices; sign one out
+  savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
+  savesync gen-config                rewrite the Ludusavi config from the registry
+  savesync doctor                    check everything is wired up
+  savesync hook before|after <app> <title> <exec> <runner> <prefix>   (Heroic calls this)
+
+<game> is the Heroic app name (see `savesync list`) or the title.
+"""
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import secrets
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+HOME = Path.home()
+APP_HOME = HOME / ".local/share/save-sync"
+CFG_HOME = HOME / ".config/save-sync"
+REGISTRY = CFG_HOME / "games.json"
+STATE = APP_HOME / "state"
+LUDUSAVI_CFG = CFG_HOME / "ludusavi"
+BACKUPS = APP_HOME / "backups"
+LOG = APP_HOME / "logs/savesync.log"
+LUDUSAVI = APP_HOME / "bin/ludusavi"
+RENPY_HOME = HOME / ".renpy"
+HEROIC_APP = "com.heroicgameslauncher.hgl"
+HEROIC_HOME = HOME / f".var/app/{HEROIC_APP}"      # sandbox HOME for anything not granted
+HEROIC_CFG = HEROIC_HOME / "config/heroic"
+HEROIC_CONFIG = HEROIC_CFG / "config.json"
+HEROIC_LIBRARY = HEROIC_CFG / "sideload_apps/library.json"
+HEROIC_GAMESCONFIG = HEROIC_CFG / "GamesConfig"
+HOOK_DIR = HOME / "Games/Heroic/save-sync"          # inside Heroic's sandbox grant
+HOOK = HOOK_DIR / "hook.sh"
+TOKENS_GAME = "Ren'Py security tokens"
+RETENTION_FULL = 10
+RCLONE = APP_HOME / "bin/rclone"
+SETTINGS = CFG_HOME / "settings.json"
+CONFLICTS = APP_HOME / "conflicts"
+DEVICE = os.environ.get("SAVESYNC_DEVICE") or socket.gethostname()
+SESSION = CFG_HOME / "session"       # the device's remembered login (0600)
+
+# First-play detection: where games write, and what to ignore there.
+WATCH_ROOTS = [RENPY_HOME, HOME / ".config", HOME / ".local/share", HEROIC_HOME]
+WATCH_SKIP = {
+    "Steam", "flatpak", "Trash", "baloo", "save-sync", "waydroid", "waydroid-images",
+    "containers", "kactivitymanagerd", "recently-used.xbel", "pulse", "dconf",
+    "fontconfig", "mesa_shader_cache", "Cache", "GPUCache", "Code Cache", "Crashpad",
+    "cache", "heroic", "Heroic", "plasma", "kwin", "klipper", "akonadi",
+    "pnpm", "podman-compose-venv", "Claude", ".wrangler", "node_modules", ".git",
+}
+NOISE = re.compile(r"(\.log|\.tmp|\.lock|\.pid|cache|shader|crash|\.old)$|/(logs?|cache|tmp)/", re.I)
+WATCH_DEPTH = 5
+
+
+# ---------------------------------------------------------------- helpers
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def say(msg):
+    print(msg)
+    log(msg)
+
+
+def notify(summary, body=""):
+    log(f"notify: {summary} | {body}")
+    if os.environ.get("SAVESYNC_NO_NOTIFY") == "1":
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "save-sync", summary, body], timeout=5)
+    except Exception:
+        pass
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def registry():
+    return load_json(REGISTRY, {})
+
+
+def find_game(reg, key):
+    if key in reg:
+        return key
+    for app, g in reg.items():
+        if g["title"].lower() == key.lower():
+            return app
+    raise SystemExit(f"unknown game: {key}  (see: savesync list)")
+
+
+def ludusavi_glob_escape(s):
+    # Ludusavi paths are globs; special chars are escaped as [x]
+    return re.sub(r"([\[\]*?{}])", r"[\1]", s)
+
+
+def to_ludusavi_path(p):
+    p = str(p)
+    home = str(HOME)
+    if p == home or p.startswith(home + "/"):
+        return "<home>" + ludusavi_glob_escape(p[len(home):])
+    return ludusavi_glob_escape(p)
+
+
+def ludusavi(*args, capture=True):
+    cmd = [str(LUDUSAVI), "--config", str(LUDUSAVI_CFG), "--no-manifest-update", *args]
+    return subprocess.run(cmd, capture_output=capture, text=True)
+
+
+# ------------------------------------------------------------ engine rules
+def is_renpy(d):
+    return d is not None and (d / "renpy").is_dir() and (d / "game").is_dir()
+
+
+def match_renpy_dir(game_dir):
+    """~/.renpy/<save_directory> by identical save contents.
+
+    <save_directory> is compiled into the game and often unrelated to its
+    name (one game uses Ren'Py's default `Testgame-<id>`), so names can't be trusted."""
+    saves = game_dir / "game/saves"
+    if not saves.is_dir() or not RENPY_HOME.is_dir():
+        return None
+    best, best_n = None, 0
+    for cand in RENPY_HOME.iterdir():
+        if not cand.is_dir() or cand.name == "tokens":
+            continue
+        n = 0
+        for f in saves.iterdir():
+            other = cand / f.name
+            if f.suffix == ".save" and other.is_file() and other.stat().st_size == f.stat().st_size \
+                    and other.read_bytes() == f.read_bytes():
+                n += 1
+        if n > best_n:
+            best, best_n = cand.name, n
+    return best
+
+
+def rule_paths(g):
+    """Save folders we can name without watching a play session."""
+    d = Path(g["game_dir"]) if g.get("game_dir") else None
+    if is_renpy(d):
+        g["engine"] = "renpy"
+        # game/saves is the copy Ren'Py keeps complete; ~/.renpy/<dir> can lag
+        # far behind (verified on a real game). Back up both.
+        paths = [str(d / "game/saves")]
+        rd = g.get("renpy_dir") or match_renpy_dir(d)
+        if rd:
+            g["renpy_dir"] = rd
+            paths.append(str(RENPY_HOME / rd))
+        return paths
+    return []
+
+
+# ------------------------------------------------------------ first-play watch
+def walk_mtimes(roots, extra=()):
+    out = {}
+    for root in [*roots, *extra]:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        base_depth = len(root.parts)
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = len(Path(dirpath).parts) - base_depth
+            dirnames[:] = [n for n in dirnames if n not in WATCH_SKIP and depth < WATCH_DEPTH]
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                try:
+                    out[p] = os.stat(p).st_mtime
+                except OSError:
+                    pass
+    return out
+
+
+def watch_roots_for(g):
+    extra = []
+    if g.get("game_dir"):
+        extra.append(g["game_dir"])
+    windows = g.get("runner") != "sideload" or g.get("exec", "").lower().endswith(".exe")
+    if windows and g.get("prefix"):
+        users = Path(g["prefix"]) / "drive_c/users"
+        if users.is_dir():
+            extra.append(str(users))
+    return extra
+
+
+def changed_dirs(before, after, started):
+    dirs = {}
+    for p, m in after.items():
+        if m < started or before.get(p) == m or NOISE.search(p):
+            continue
+        d = os.path.dirname(p)
+        dirs[d] = dirs.get(d, 0) + 1
+    # collapse children into their parent when both changed
+    keep = []
+    for d in sorted(dirs, key=len):
+        if not any(d.startswith(k + "/") for k in keep):
+            keep.append(d)
+    return keep[:5]
+
+
+# ------------------------------------------------------------ Ludusavi config
+def custom_games(reg):
+    out = []
+    for g in reg.values():
+        if g.get("save_paths"):
+            out.append({"name": g["title"], "integration": "override",
+                        "files": [to_ludusavi_path(p) for p in g["save_paths"]]})
+    out.append({"name": TOKENS_GAME, "integration": "override", "files": ["<home>/.renpy/tokens"]})
+    return out
+
+
+def cmd_gen_config(_args=None, quiet=False, redirects=()):
+    cfg = {
+        "manifest": {"enable": False},  # only our own custom games
+        "release": {"check": False},
+        "roots": [],
+        "backup": {
+            "path": str(BACKUPS),
+            "retention": {"full": RETENTION_FULL, "differential": 0},
+            "format": {"chosen": "zip", "zip": {"compression": "zstd"}},
+        },
+        "restore": {"path": str(BACKUPS)},
+        "cloud": {"remote": None, "path": "save-sync", "synchronize": False},
+        "customGames": custom_games(registry()),
+        "redirects": list(redirects),
+    }
+    LUDUSAVI_CFG.mkdir(parents=True, exist_ok=True)
+    # JSON is valid YAML; Ludusavi fills every omitted key with its default.
+    save_json(LUDUSAVI_CFG / "config.yaml", cfg)
+    r = ludusavi("config", "show")
+    if r.returncode != 0:
+        raise SystemExit(f"Ludusavi rejected the generated config:\n{r.stderr}")
+    if not quiet:
+        say(f"  wrote {LUDUSAVI_CFG / 'config.yaml'} ({len(cfg['customGames'])} custom games)")
+
+
+def has_files(paths):
+    for p in paths:
+        p = Path(p)
+        if p.is_file() or (p.is_dir() and any(f.is_file() for f in p.rglob("*"))):
+            return True
+    return False
+
+
+def ensure_config():
+    cfg = LUDUSAVI_CFG / "config.yaml"
+    if not cfg.exists() or (REGISTRY.exists() and REGISTRY.stat().st_mtime > cfg.stat().st_mtime):
+        cmd_gen_config(quiet=True)
+
+
+def backup(titles):
+    """Back up the named games (plus Ren'Py's device keys if present).
+
+    Ludusavi errors with "No info" for a game with no files yet, so those are
+    skipped: a brand-new game with no saves isn't a failure."""
+    ensure_config()
+    reg = registry().values()
+    wanted = [t for t in titles
+              if has_files(next((g.get("save_paths", []) for g in reg if g["title"] == t), []))]
+    if (RENPY_HOME / "tokens").is_dir():
+        wanted.append(TOKENS_GAME)
+    if not wanted:
+        return subprocess.CompletedProcess([], 0, "nothing to back up yet", "")
+    r = ludusavi("backup", "--force", *wanted)
+    if r.returncode != 0:
+        log(f"backup failed: {r.stderr.strip()}")
+    return r
+
+
+
+# ------------------------------------------------------------ cloud sync
+# Cloud layout (per game, by title):
+#   games/<title>/            mirror of the pushing device's Ludusavi backup dir
+#   games/<title>.head.json   {fp, device, time, game_dir}: what the cloud holds
+# Local: state/<title>.base.json = the fp both sides agreed on at the last sync.
+# The glue owns direction (3-way: base / local / cloud); Ludusavi only makes and
+# restores backups.
+
+class Offline(Exception):
+    pass
+
+
+def settings():
+    return load_json(SETTINGS, {})
+
+
+def cloud_env():
+    """rclone remote `ss:` defined purely by env vars, never written to disk."""
+    c = settings().get("cloud") or {}
+    if os.environ.get("SAVESYNC_OFFLINE") == "1":
+        raise Offline("SAVESYNC_OFFLINE=1")
+    mode = c.get("mode")
+    if mode == "local":                      # stand-in cloud for tests
+        return {"RCLONE_CONFIG_SS_TYPE": "alias", "RCLONE_CONFIG_SS_REMOTE": c["path"]}
+    if mode == "worker":
+        return worker_cloud_env(c)
+    return None                              # cloud not configured: local backups only
+
+
+class SignedOut(Exception):
+    pass
+
+
+def worker_call(url, method="GET", body=None, token=None, timeout=15):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"content-type": "application/json",
+                                          "user-agent": "save-sync"})
+    if token:
+        req.add_header("authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise SignedOut("session expired or revoked")
+        try:
+            return {"_status": e.code, **json.loads(e.read() or b"{}")}
+        except Exception:
+            raise Offline(f"worker HTTP {e.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise Offline(f"worker unreachable: {e}")
+
+
+def obscure(secret):
+    r = subprocess.run([str(RCLONE), "obscure", "-"], input=secret, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("rclone obscure failed")
+    return r.stdout.strip()
+
+
+def worker_cloud_env(c):
+    """Fetch the R2 key + crypt key for this sync. Held in memory only."""
+    if not SESSION.exists():
+        notify("save-sync: not signed in", "Run: savesync login (in Desktop Mode)")
+        raise Offline("not signed in")
+    try:
+        k = worker_call(c["url"].rstrip("/") + "/keys", "POST", {}, SESSION.read_text().strip())
+    except SignedOut:
+        notify("save-sync: signed out", "Sign in again in Desktop Mode: savesync login")
+        raise Offline("signed out")
+    r2, cr = k["r2"], k["crypt"]
+    return {
+        "RCLONE_CONFIG_R2_TYPE": "s3", "RCLONE_CONFIG_R2_PROVIDER": "Cloudflare",
+        "RCLONE_CONFIG_R2_ACCESS_KEY_ID": r2["access_key_id"],
+        "RCLONE_CONFIG_R2_SECRET_ACCESS_KEY": r2["secret_access_key"],
+        "RCLONE_CONFIG_R2_ENDPOINT": r2["endpoint"],
+        "RCLONE_CONFIG_R2_NO_CHECK_BUCKET": "true",
+        "RCLONE_CONFIG_SS_TYPE": "crypt",
+        "RCLONE_CONFIG_SS_REMOTE": f"r2:{r2['bucket']}",
+        "RCLONE_CONFIG_SS_PASSWORD": obscure(cr["password"]),
+        "RCLONE_CONFIG_SS_PASSWORD2": obscure(cr["salt"]),
+    }
+
+
+def cmd_login(_args=None):
+    c = settings().get("cloud") or {}
+    if c.get("mode") != "worker":
+        raise SystemExit("cloud isn't configured on this device (settings.json has no worker url)")
+    base = c["url"].rstrip("/")
+    p = secrets.token_urlsafe(32)
+    h = hashlib.sha256(p.encode()).hexdigest()
+    url = f"{base}/auth/start?h={h}&device={urllib.request.quote(DEVICE)}"
+    say(f"Opening your browser to sign in with Google…\nIf it doesn't open, visit:\n  {url}")
+    try:
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        webbrowser.open(url)
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            r = worker_call(base + "/auth/poll", "POST", {"p": p})
+        except Offline as e:
+            say(f"  (waiting: {e})")
+            continue
+        state = r.get("state")
+        if state == "done":
+            CFG_HOME.mkdir(parents=True, exist_ok=True)
+            fd = os.open(SESSION, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(r["token"])
+            say(f"Signed in. {DEVICE} will sync on every game launch and exit.")
+            return
+        if state in ("denied", "expired"):
+            raise SystemExit(f"Sign-in {state}.")
+    raise SystemExit("Timed out waiting for sign-in (10 min).")
+
+
+def cmd_devices(args):
+    c = settings().get("cloud") or {}
+    base = c["url"].rstrip("/")
+    tok = SESSION.read_text().strip()
+    if args[:1] == ["--revoke"] and len(args) == 2:
+        say(json.dumps(worker_call(f"{base}/devices?id={args[1]}", "DELETE", token=tok)))
+        return
+    for d in worker_call(base + "/devices", token=tok).get("devices", []):
+        seen = time.strftime("%Y-%m-%d", time.localtime(d.get("touched", 0)))
+        say(f"  {d['id']}  {d.get('device', '?'):<20} last used {seen}{'  (this device)' if d.get('this') else ''}")
+
+
+def rclone(env, *args, check=True):
+    cmd = [str(RCLONE), "--contimeout", "5s", "--timeout", "20s", "--retries", "2",
+           "--low-level-retries", "2", *args]
+    r = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        msg = r.stderr.strip().splitlines()[-1:] or [""]
+        raise Offline(msg[0])
+    return r
+
+
+def cloud_head(env, title):
+    r = rclone(env, "cat", f"ss:games/{title}.head.json", check=False)
+    if r.returncode == 0:
+        return json.loads(r.stdout)
+    if "not found" in r.stderr.lower() or "doesn't exist" in r.stderr.lower() \
+            or "no such file" in r.stderr.lower():
+        return None
+    raise Offline((r.stderr.strip().splitlines() or ["rclone error"])[-1])
+
+
+def put_head(env, title, head):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = STATE / f"{title}.head.upload.json"
+    tmp.write_text(json.dumps(head))
+    rclone(env, "copyto", str(tmp), f"ss:games/{title}.head.json")
+    tmp.unlink(missing_ok=True)
+
+
+def fingerprint(paths):
+    """Content hash of the live saves, independent of mtimes and device."""
+    h = hashlib.sha256()
+    files = []
+    for p in paths:
+        p = Path(p)
+        if p.is_file():
+            files.append(p)
+        elif p.is_dir():
+            files += [f for f in p.rglob("*") if f.is_file()]
+    for f in sorted(set(files)):
+        h.update(str(f.relative_to(HOME) if str(f).startswith(str(HOME)) else f).encode())
+        h.update(b"\0")
+        h.update(hashlib.sha256(f.read_bytes()).digest())
+    return h.hexdigest() if files else "empty"
+
+
+def base_file(title):
+    return STATE / f"{title}.base.json"
+
+
+def get_base(title):
+    return load_json(base_file(title), {}).get("fp")
+
+
+def set_base(title, fp):
+    save_json(base_file(title), {"fp": fp, "time": time.time(), "device": DEVICE})
+
+
+def pending_file(title):
+    return STATE / f"{title}.pending"
+
+
+def backup_dir(title):
+    return BACKUPS / title
+
+
+def quarantine(title, g, why, env=None):
+    """Keep the losing side before anything is overwritten: this device's live
+    saves + backups, and (when this device wins) the cloud's backups too."""
+    dest = CONFLICTS / title / time.strftime("%Y%m%d-%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for i, p in enumerate(g.get("save_paths", [])):
+        if Path(p).exists():
+            target = dest / f"live-{i}-{Path(p).name}"
+            if Path(p).is_dir():
+                shutil.copytree(p, target)
+            else:
+                shutil.copy2(p, target)
+    if backup_dir(title).is_dir():
+        shutil.copytree(backup_dir(title), dest / "backups")
+    if env is not None:
+        rclone(env, "copy", f"ss:games/{title}", str(dest / "cloud-backups"))
+        rclone(env, "copyto", f"ss:games/{title}.head.json", str(dest / "cloud-head.json"), check=False)
+    (dest / "WHY.txt").write_text(f"{why}\nsave paths: {g.get('save_paths')}\n")
+    log(f"sync {title}: quarantined both sides' local copy to {dest}")
+    return dest
+
+
+def pull(env, title, g, head):
+    """Cloud -> local backups -> live saves."""
+    bdir = backup_dir(title)
+    bdir.mkdir(parents=True, exist_ok=True)
+    rclone(env, "sync", f"ss:games/{title}", str(bdir))
+    redirects = []
+    old, new = head.get("game_dir"), g.get("game_dir")
+    if old and new and old != new:
+        # the other device has the game in a different (version) folder
+        redirects.append({"kind": "restore", "source": old, "target": new})
+    cmd_gen_config(quiet=True, redirects=redirects)
+    r = ludusavi("restore", "--force", "--no-cloud-sync", title)
+    if redirects:
+        cmd_gen_config(quiet=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"restore failed: {r.stderr.strip()}")
+    log(f"sync {title}: pulled from cloud (pushed by {head.get('device')} at "
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(head.get('time', 0)))})")
+
+
+def push(env, title, g, fp):
+    bdir = backup_dir(title)
+    if not bdir.is_dir():
+        return
+    rclone(env, "sync", str(bdir), f"ss:games/{title}")
+    put_head(env, title, {"fp": fp, "device": DEVICE, "time": time.time(),
+                          "game_dir": g.get("game_dir")})
+    log(f"sync {title}: pushed to cloud")
+
+
+def newest_local_mtime(g):
+    m = 0
+    for p in g.get("save_paths", []):
+        p = Path(p)
+        files = [p] if p.is_file() else (list(p.rglob("*")) if p.is_dir() else [])
+        m = max([m] + [f.stat().st_mtime for f in files if f.is_file()])
+    return m
+
+
+def ask_conflict(title, head, local_fp, g=None):
+    """'cloud' | 'local' | 'later'. Steam-style prompt; falls back to newest-wins."""
+    forced = os.environ.get("SAVESYNC_CONFLICT_CHOICE")
+    if forced:
+        return forced
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(head.get("time", 0)))
+    text = (f"{title}: the cloud and this device both have saves the other hasn't seen.\n\n"
+            f"Cloud: saved on {head.get('device')} at {when}\n"
+            f"This device: {DEVICE}\n\n"
+            f"Whichever you don't pick is kept in\n~/.local/share/save-sync/conflicts/")
+    try:
+        r = subprocess.run(["kdialog", "--title", f"save-sync: {title}", "--warningyesnocancel", text,
+                            "--yes-label", "Use cloud save", "--no-label", "Use this device's save",
+                            "--cancel-label", "Decide later"], timeout=600)
+        return {0: "cloud", 1: "local"}.get(r.returncode, "later")
+    except Exception as e:
+        log(f"sync {title}: conflict dialog failed ({e!r}); newest wins")
+        # both sides are quarantined before anything is overwritten
+        return "cloud" if head.get("time", 0) >= newest_local_mtime(g or {}) else "local"
+
+
+def sync_before(g):
+    """Before the game starts: make the live saves the newest agreed state."""
+    title = g["title"]
+    if not g.get("save_paths"):
+        return
+    try:
+        env = cloud_env()
+        if env is None:
+            return
+        head = cloud_head(env, title)
+    except Offline as e:
+        notify(f"{title}: offline, playing with this device's saves", "It will sync when you're back online.")
+        log(f"sync {title}: offline before launch ({e})")
+        return
+    local_fp = fingerprint(g["save_paths"])
+    base = get_base(title)
+    if head is None:
+        return                                 # nothing in the cloud yet; the exit pushes
+    cloud_fp = head["fp"]
+    if cloud_fp == local_fp:
+        set_base(title, cloud_fp)
+        return
+    local_changed = local_fp != base and local_fp != "empty"
+    cloud_changed = cloud_fp != base
+    if not local_changed:                      # only the cloud moved on (or first time here)
+        pull(env, title, g, head)
+        set_base(title, fingerprint(g["save_paths"]))
+        if fingerprint(g["save_paths"]) != cloud_fp:
+            log(f"sync {title}: after pull, live fp differs from cloud fp (restore wrote other paths?)")
+        set_base(title, cloud_fp)
+        return
+    if not cloud_changed:                      # only this device moved on (missed push)
+        push_now(env, title, g)
+        return
+    choice = ask_conflict(title, head, local_fp, g)
+    log(f"sync {title}: conflict (base={str(base)[:8]} local={local_fp[:8]} cloud={cloud_fp[:8]}) -> {choice}")
+    if choice == "later":
+        pending_file(title).write_text("conflict")
+        return
+    quarantine(title, g, f"conflict before launch; chose {choice}", env if choice == "local" else None)
+    if choice == "cloud":
+        pull(env, title, g, head)
+        set_base(title, cloud_fp)
+    else:
+        push_now(env, title, g)
+
+
+def push_now(env, title, g):
+    r = backup([title])
+    if r.returncode != 0:
+        raise RuntimeError(f"backup failed: {r.stderr.strip()}")
+    fp = fingerprint(g["save_paths"])
+    push(env, title, g, fp)
+    set_base(title, fp)
+    pending_file(title).unlink(missing_ok=True)
+
+
+def sync_after(g):
+    """After the game exits (backup already taken): publish if it changed."""
+    title = g["title"]
+    fp = fingerprint(g["save_paths"])
+    base = get_base(title)
+    if pending_file(title).exists() and pending_file(title).read_text() == "conflict":
+        log(f"sync {title}: unresolved conflict, not pushing (next launch asks again)")
+        return
+    if fp == base:
+        return
+    try:
+        env = cloud_env()
+        if env is None:
+            return
+        head = cloud_head(env, title)
+        if head and head["fp"] not in (base, fp):
+            # someone else pushed while we played
+            choice = ask_conflict(title, head, fp, g)
+            log(f"sync {title}: conflict after play -> {choice}")
+            if choice == "later":
+                pending_file(title).write_text("conflict")
+                return
+            quarantine(title, g, f"conflict after play; chose {choice}", env if choice == "local" else None)
+            if choice == "cloud":
+                pull(env, title, g, head)
+                set_base(title, head["fp"])
+                return
+        push(env, title, g, fp)
+        set_base(title, fp)
+        pending_file(title).unlink(missing_ok=True)
+    except Offline as e:
+        pending_file(title).write_text("push")
+        notify(f"{title}: saved locally, not synced", "Offline; it will upload when you're back online.")
+        log(f"sync {title}: offline after play ({e}); pending")
+
+
+def cmd_sync(args):
+    """Push anything pending (the flush timer runs this), or sync named games."""
+    reg = registry()
+    pending_only = "--pending" in args
+    names = [a for a in args if not a.startswith("--")]
+    for app, g in reg.items():
+        if names and app not in names and g["title"] not in names:
+            continue
+        title = g["title"]
+        state = pending_file(title).read_text() if pending_file(title).exists() else None
+        if pending_only and state != "push":
+            continue
+        try:
+            if state == "push" or not pending_only:
+                sync_after(g) if state == "push" else (sync_before(g), sync_after(g))
+        except Offline as e:
+            log(f"sync {title}: still offline ({e})")
+        except Exception as e:
+            log(f"sync {title}: ERROR {e!r}")
+    for f in STATE.glob("*.pending") if STATE.exists() else []:
+        say(f"  pending: {f.stem} ({f.read_text()})")
+
+
+# ------------------------------------------------------------ hook (Heroic)
+def cmd_hook(args):
+    if len(args) < 6:
+        raise SystemExit("usage: savesync hook before|after <app> <title> <exec> <runner> <prefix>")
+    stage, app, title, exe, runner, prefix = args[:6]
+    try:
+        (hook_before if stage == "before" else hook_after)(app, title, exe, runner, prefix)
+    except Exception as e:  # never break a game launch
+        log(f"hook {stage} {app}: ERROR {e!r}")
+        notify(f"{title}: save-sync error", str(e))
+
+
+def hook_before(app, title, exe, runner, prefix):
+    reg = registry()
+    g = reg.get(app)
+    if g is None:
+        if runner != "sideload":
+            log(f"before {app}: runner {runner} not handled yet, skipped")
+            return
+        g = {"title": title, "runner": runner, "exec": exe, "prefix": prefix,
+             "game_dir": str(Path(exe).parent) if exe else None,
+             "save_paths": [], "confirmed": False, "added": time.strftime("%Y-%m-%d")}
+        g["save_paths"] = rule_paths(g)
+        reg[app] = g
+        save_json(REGISTRY, reg)
+        cmd_gen_config(quiet=True)
+        log(f"before {app}: new game '{title}', rule paths {g['save_paths']}")
+    else:
+        old_dir = g.get("game_dir")
+        new_dir = str(Path(exe).parent) if exe else old_dir
+        g.update({"title": title, "exec": exe, "prefix": prefix, "game_dir": new_dir})
+        if old_dir and new_dir != old_dir:
+            # Game updated to a new folder (SpiderMan-1.0-pc -> SpiderMan-1.1-pc): save
+            # folders inside the old game folder move with it.
+            g["save_paths"] = [new_dir + p[len(old_dir):] if p == old_dir or p.startswith(old_dir + "/")
+                               else p for p in g.get("save_paths", [])]
+            log(f"before {app}: game moved {old_dir} -> {new_dir}, save paths follow")
+            cmd_gen_config(quiet=True)
+        save_json(REGISTRY, reg)
+    sync_before(g)
+    # Remember the state so the after-hook can tell which folders the game
+    # wrote to (until the save folders are confirmed).
+    if not g.get("confirmed"):
+        STATE.mkdir(parents=True, exist_ok=True)
+        snap = walk_mtimes(WATCH_ROOTS, watch_roots_for(g))
+        save_json(STATE / f"{app}.snap.json", {"started": time.time(), "files": snap})
+    log(f"before {app}: ok")
+
+
+def hook_after(app, title, exe, runner, prefix):
+    reg = registry()
+    g = reg.get(app)
+    if g is None:
+        log(f"after {app}: not registered, skipped")
+        return
+    snap_file = STATE / f"{app}.snap.json"
+    if not g.get("confirmed") and snap_file.exists():
+        snap = load_json(snap_file, {})
+        after = walk_mtimes(WATCH_ROOTS, watch_roots_for(g))
+        found = changed_dirs(snap.get("files", {}), after, snap.get("started", time.time()))
+        if g.get("engine") == "renpy":
+            g["save_paths"] = rule_paths(g)   # ~/.renpy dir may exist now
+        new = [d for d in found if not any(d == p or d.startswith(p + "/") for p in g["save_paths"])]
+        if new:
+            g["save_paths"] = g["save_paths"] + new
+            log(f"after {app}: first-play detection added {new}")
+        snap_file.unlink(missing_ok=True)
+        save_json(REGISTRY, reg)
+        cmd_gen_config(quiet=True)
+        if g["save_paths"]:
+            notify(f"{title}: saves found (not confirmed yet)",
+                   "\n".join(g["save_paths"]) + f"\nChange with: savesync paths '{app}' --set …")
+        else:
+            notify(f"{title}: no save folder found", f"Set it with: savesync paths '{app}' --set <folder>")
+    if not g.get("save_paths"):
+        return
+    r = backup([g["title"]])
+    if r.returncode != 0:
+        notify(f"{title}: save backup FAILED", "See ~/.local/share/save-sync/logs/savesync.log")
+        return
+    log(f"after {app}: backup ok")
+    sync_after(g)
+
+
+# ------------------------------------------------------------ user commands
+def cmd_list(_args=None):
+    reg = registry()
+    if not reg:
+        say("No games yet. Launch a game from Heroic once and it shows up here.")
+        return
+    for app, g in sorted(reg.items(), key=lambda x: x[1]["title"].lower()):
+        mark = "confirmed" if g.get("confirmed") else "NOT confirmed"
+        say(f"{g['title']}  [{app}]  ({mark})")
+        for p in g.get("save_paths") or ["(no save folder yet)"]:
+            exists = "" if p.startswith("(") or Path(p).exists() else "  (missing)"
+            say(f"    {p}{exists}")
+
+
+def cmd_paths(args):
+    if not args:
+        raise SystemExit("usage: savesync paths <game> [--set P… | --add P | --detect]")
+    reg = registry()
+    app = find_game(reg, args[0])
+    g = reg[app]
+    rest = args[1:]
+    if not rest:
+        cmd_list_one(g, app)
+        return
+    if rest[0] == "--set" and rest[1:]:
+        g["save_paths"] = [str(Path(os.path.expanduser(p)).resolve()) for p in rest[1:]]
+        g["confirmed"] = True
+    elif rest[0] == "--add" and len(rest) == 2:
+        g["save_paths"] = g.get("save_paths", []) + [str(Path(os.path.expanduser(rest[1])).resolve())]
+        g["confirmed"] = True
+    elif rest[0] == "--detect":
+        g["save_paths"] = rule_paths(g)
+        g["confirmed"] = False   # watch the next play session again
+    elif rest[0] == "--confirm":
+        g["confirmed"] = True
+    else:
+        raise SystemExit("usage: savesync paths <game> [--set P… | --add P | --detect | --confirm]")
+    missing = [p for p in g["save_paths"] if not Path(p).exists()]
+    save_json(REGISTRY, reg)
+    cmd_gen_config(quiet=True)
+    cmd_list_one(g, app)
+    if missing:
+        say(f"  note: doesn't exist (yet): {', '.join(missing)}")
+
+
+def cmd_list_one(g, app):
+    say(f"{g['title']}  [{app}]  ({'confirmed' if g.get('confirmed') else 'NOT confirmed'})")
+    for p in g.get("save_paths", []):
+        say(f"    {p}")
+
+
+def cmd_backup(args):
+    reg = registry()
+    titles = [reg[find_game(reg, a)]["title"] for a in args] if args else \
+             [g["title"] for g in reg.values() if g.get("save_paths")]
+    r = backup(titles)
+    say(r.stdout.strip()[-1500:] if r.stdout else "")
+    if r.returncode != 0:
+        raise SystemExit(f"backup failed: {r.stderr.strip()}")
+
+
+# ------------------------------------------------------------ Heroic setup
+def heroic_running():
+    # pgrep -f would also match any shell whose command line mentions the id
+    r = subprocess.run(["flatpak", "ps", "--columns=application"], capture_output=True, text=True)
+    return HEROIC_APP in r.stdout.split()
+
+
+def hook_script():
+    savesync = HOME / ".local/bin/savesync"
+    return f"""#!/bin/sh
+# Generated by save-sync. Heroic runs this before and after every game
+# (Settings → Games → Scripts). The work happens on the host.
+exec flatpak-spawn --host {savesync} hook "$HEROIC_GAME_SCRIPT_STAGE" \\
+  "$HEROIC_GAME_APP_NAME" "$HEROIC_GAME_TITLE" "$HEROIC_GAME_EXEC" \\
+  "$HEROIC_GAME_RUNNER" "$HEROIC_GAME_PREFIX"
+"""
+
+
+def cmd_setup_heroic(_args=None):
+    HOOK_DIR.mkdir(parents=True, exist_ok=True)
+    HOOK.write_text(hook_script())
+    HOOK.chmod(0o755)
+    if heroic_running():
+        raise SystemExit("Heroic is running; it rewrites its config on exit. Quit Heroic and re-run.")
+    cfg = load_json(HEROIC_CONFIG, None)
+    if cfg is None:
+        raise SystemExit(f"Heroic config not found at {HEROIC_CONFIG}. Start Heroic once, quit, re-run.")
+    shutil.copyfile(HEROIC_CONFIG, HEROIC_CONFIG.with_suffix(".json.save-sync.bak"))
+    d = cfg.setdefault("defaultSettings", {})
+    for key in ("beforeLaunchScriptPath", "afterLaunchScriptPath"):
+        cur = d.get(key) or ""
+        if cur and cur != str(HOOK):
+            say(f"  ! Heroic already has a global {key}: {cur}. Left alone; save-sync is NOT hooked.")
+            continue
+        d[key] = str(HOOK)
+    save_json(HEROIC_CONFIG, cfg)
+    say(f"  Heroic global Before/After launch scripts → {HOOK}")
+    # A game's own settings file snapshots every global value once you change
+    # any of its settings; an empty script path there would bypass the hook.
+    for f in sorted(HEROIC_GAMESCONFIG.glob("*.json")):
+        data = load_json(f, {})
+        changed = False
+        for app, s in data.items():
+            if not isinstance(s, dict):
+                continue
+            for key in ("beforeLaunchScriptPath", "afterLaunchScriptPath"):
+                if key in s and s[key] == "":
+                    s[key] = str(HOOK)
+                    changed = True
+        if changed:
+            save_json(f, data)
+            say(f"  patched per-game hook in {f.name}")
+    migrate_phase1()
+
+
+def migrate_phase1():
+    """Phase-1 builds sideloaded games as ~/Games/Heroic/save-sync/<slug>.sh
+    launchers keyed by slug. Point them at the real game and key by app name."""
+    reg = registry()
+    old = {k: v for k, v in reg.items() if "dir_pattern" in v}
+    if not old:
+        return
+    lib = load_json(HEROIC_LIBRARY, {"games": []})
+    shutil.copyfile(HEROIC_LIBRARY, HEROIC_LIBRARY.with_suffix(".json.save-sync.bak"))
+    for slug, g in old.items():
+        root = Path(os.path.expanduser(g["root"]))
+        dirs = sorted((Path(p) for p in glob.glob(str(root / g["dir_pattern"])) if Path(p).is_dir()),
+                      key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)])
+        app = "savesync-" + slug
+        del reg[slug]
+        if not dirs:
+            say(f"  ! {g['title']}: game folder not found, dropped")
+            continue
+        d = dirs[-1]
+        exe = d / g["launcher"]
+        new = {"title": g["title"], "runner": "sideload", "exec": str(exe), "prefix": "",
+               "game_dir": str(d), "renpy_dir": g.get("renpy_dir"), "save_paths": [],
+               "confirmed": False, "added": time.strftime("%Y-%m-%d")}
+        new["save_paths"] = rule_paths(new)
+        reg[app] = new
+        for e in lib.get("games", []):
+            if e.get("app_name") == app:
+                e["install"]["executable"] = str(exe)
+                e["folder_name"] = str(d)
+        say(f"  migrated {g['title']} → Heroic runs {exe} directly")
+    save_json(HEROIC_LIBRARY, lib)
+    save_json(REGISTRY, reg)
+    for p in HOOK_DIR.glob("*.sh"):
+        if p != HOOK:
+            p.unlink()
+    cmd_gen_config(quiet=True)
+
+
+def cmd_unhook_heroic(_args=None):
+    if heroic_running():
+        raise SystemExit("Quit Heroic first.")
+    cfg = load_json(HEROIC_CONFIG, {})
+    d = cfg.get("defaultSettings", {})
+    for key in ("beforeLaunchScriptPath", "afterLaunchScriptPath"):
+        if d.get(key) == str(HOOK):
+            d[key] = ""
+    save_json(HEROIC_CONFIG, cfg)
+    for f in HEROIC_GAMESCONFIG.glob("*.json"):
+        data = load_json(f, {})
+        for s in data.values():
+            if isinstance(s, dict):
+                for key in ("beforeLaunchScriptPath", "afterLaunchScriptPath"):
+                    if s.get(key) == str(HOOK):
+                        s[key] = ""
+        save_json(f, data)
+    shutil.rmtree(HOOK_DIR, ignore_errors=True)
+    say("  Heroic hooks removed")
+
+
+# ------------------------------------------------------------ doctor
+def cmd_doctor(_args=None):
+    problems = 0
+
+    def check(ok_, msg, fix=""):
+        nonlocal problems
+        print(f"  [{'✓' if ok_ else 'x'}] {msg}" + ("" if ok_ else f"  → {fix}"))
+        problems += 0 if ok_ else 1
+
+    check(LUDUSAVI.exists() and os.access(LUDUSAVI, os.X_OK), f"ludusavi at {LUDUSAVI}", "./install.sh")
+    check((APP_HOME / "bin/rclone").exists(), "rclone installed (for the cloud phase)", "./install.sh")
+    check((HOME / ".local/bin/savesync").exists(), "savesync on PATH (~/.local/bin)", "./install.sh")
+    check((LUDUSAVI_CFG / "config.yaml").exists() and ludusavi("config", "show").returncode == 0,
+          "Ludusavi config valid", "savesync gen-config")
+    ov = subprocess.run(["flatpak", "override", "--user", "--show", HEROIC_APP],
+                        capture_output=True, text=True).stdout
+    check("org.freedesktop.Flatpak=talk" in ov, "Heroic hooks can reach the host", "./install.sh")
+    check("~/games" in ov and "~/.renpy" in ov, "Heroic can see ~/games and ~/.renpy", "./install.sh")
+    check(HOOK.exists(), f"hook script {HOOK}", "savesync setup-heroic")
+    d = load_json(HEROIC_CONFIG, {}).get("defaultSettings", {})
+    check(d.get("beforeLaunchScriptPath") == str(HOOK) and d.get("afterLaunchScriptPath") == str(HOOK),
+          "Heroic global Before/After scripts point at save-sync", "quit Heroic, savesync setup-heroic")
+    for f in sorted(HEROIC_GAMESCONFIG.glob("*.json")):
+        for app, s in load_json(f, {}).items():
+            if isinstance(s, dict):
+                for key in ("beforeLaunchScriptPath", "afterLaunchScriptPath"):
+                    if key in s and s[key] != str(HOOK):
+                        check(False, f"{app}: per-game {key} bypasses save-sync ({s[key]!r})",
+                              "quit Heroic, savesync setup-heroic")
+    reg = registry()
+    for app, g in sorted(reg.items()):
+        paths = g.get("save_paths", [])
+        check(bool(paths) and all(Path(p).exists() for p in paths),
+              f"{g['title']}: {len(paths)} save folder(s)", f"savesync paths '{app}' --set <folder>")
+        if not g.get("confirmed"):
+            print(f"  [ ] {g['title']}: save folders not confirmed yet (savesync paths '{app}' --confirm)")
+    print("  all good" if problems == 0 else f"  {problems} problem(s)")
+    return problems == 0
+
+
+COMMANDS = {
+    "list": cmd_list, "paths": cmd_paths, "backup": cmd_backup,
+    "setup-heroic": cmd_setup_heroic, "unhook-heroic": cmd_unhook_heroic,
+    "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
+    "login": cmd_login, "devices": cmd_devices,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        sys.exit(2)
+    res = COMMANDS[sys.argv[1]](sys.argv[2:])
+    if sys.argv[1] == "doctor" and res is False:
+        sys.exit(1)

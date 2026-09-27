@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.log
+*.tmp
+# never commit device credentials (cloud phase)
+*.secret
+.dev.vars
+.env
+.env.*
+.wrangler/
+node_modules/
