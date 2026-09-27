@@ -56,6 +56,23 @@
 - `wrap` isn't used. `savesync run` launches the game itself so it can forward SIGTERM, detect
   the save dir on first play, and later own the cloud sync direction.
 
+## Incident 2026-09-27: detection picked ~/.config and the whole game folder
+- The first real Heroic launch on the PC (a Ren'Py game, not yet confirmed) ran first-play detection even
+  though the Ren'Py rule already knew its folders. Other apps writing to `~/.config` during play,
+  plus `log.txt` in the game root, made `~/.config` and the game's root the "save folders". The
+  after-hook then started backing them up (a partial 8.7 GB zip), and Heroic showed the game as
+  still running while it waited. It was killed by hand; nothing was uploaded (push only follows a
+  successful backup), and the partial zip was deleted.
+- Fixes:
+  - Detection runs only when no engine rule applies.
+  - A watch root, HOME or the game root is never suggested.
+  - Anything over 300 MB or 3000 files is rejected.
+  - Results are only **suggestions**, never backed up until the user adds them; `--confirm`
+    refuses when there's more than one.
+  - The noise filter now checks the home-relative path, so `/tmp/` in an absolute path no longer
+    hides everything.
+- Regression test: `tests/detection-test.sh`.
+
 ## Cloud (R2 + crypt + Worker), 2026-09-27
 - `rclone cat` of a missing object on R2 exits 0 with empty output (the local stand-in errored).
   An empty head is read as "nothing in the cloud yet".

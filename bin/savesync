@@ -218,19 +218,52 @@ def watch_roots_for(g):
     return extra
 
 
-def changed_dirs(before, after, started):
-    dirs = {}
+MAX_SUGGEST_BYTES = 300 * 1024 * 1024
+MAX_SUGGEST_FILES = 3000
+
+
+def dir_size(d):
+    n = size = 0
+    for f in Path(d).rglob("*"):
+        if f.is_file():
+            n += 1
+            size += f.stat().st_size
+            if n > MAX_SUGGEST_FILES or size > MAX_SUGGEST_BYTES:
+                break
+    return n, size
+
+
+def changed_dirs(before, after, started, roots, game_dir=None):
+    """Folders a play session wrote to, as SUGGESTIONS (never backed up
+    until confirmed). Never a watch root, HOME, or the game's own root: other
+    apps write to ~/.config during play, and games write logs next to their
+    binary (2026-09-27: ~/.config and the whole game folder were picked)."""
+    forbidden = {str(HOME)} | {str(Path(r)) for r in roots}
+    if game_dir:
+        forbidden.add(str(Path(game_dir)))
+    counts = {}
     for p, m in after.items():
-        if m < started or before.get(p) == m or NOISE.search(p):
+        rel = p[len(str(HOME)):] if p.startswith(str(HOME) + "/") else p
+        if m < started or before.get(p) == m or NOISE.search(rel):
             continue
         d = os.path.dirname(p)
-        dirs[d] = dirs.get(d, 0) + 1
-    # collapse children into their parent when both changed
+        if d in forbidden or any(d == f for f in forbidden):
+            continue                   # a file directly in a root: not evidence of a save dir
+        counts[d] = counts.get(d, 0) + 1
     keep = []
-    for d in sorted(dirs, key=len):
+    for d in sorted(counts, key=len):  # collapse children into an already-kept parent
         if not any(d.startswith(k + "/") for k in keep):
             keep.append(d)
-    return keep[:5]
+    out = []
+    for d in keep:
+        if any(d == f for f in forbidden):
+            continue
+        n, size = dir_size(d)
+        if n > MAX_SUGGEST_FILES or size > MAX_SUGGEST_BYTES:
+            log(f"detection: ignored {d} (too big to be a save folder: {n}+ files, {size >> 20}+ MB)")
+            continue
+        out.append(d)
+    return out[:5]
 
 
 # ------------------------------------------------------------ Ludusavi config
@@ -740,7 +773,7 @@ def hook_before(app, title, exe, runner, prefix):
     sync_before(g)
     # Remember the state so the after-hook can tell which folders the game
     # wrote to (until the save folders are confirmed).
-    if not g.get("confirmed"):
+    if not g.get("confirmed") and not g.get("engine"):
         STATE.mkdir(parents=True, exist_ok=True)
         snap = walk_mtimes(WATCH_ROOTS, watch_roots_for(g))
         save_json(STATE / f"{app}.snap.json", {"started": time.time(), "files": snap})
@@ -756,22 +789,21 @@ def hook_after(app, title, exe, runner, prefix):
     snap_file = STATE / f"{app}.snap.json"
     if not g.get("confirmed") and snap_file.exists():
         snap = load_json(snap_file, {})
+        roots = [*WATCH_ROOTS, *watch_roots_for(g)]
         after = walk_mtimes(WATCH_ROOTS, watch_roots_for(g))
-        found = changed_dirs(snap.get("files", {}), after, snap.get("started", time.time()))
-        if g.get("engine") == "renpy":
-            g["save_paths"] = rule_paths(g)   # ~/.renpy dir may exist now
-        new = [d for d in found if not any(d == p or d.startswith(p + "/") for p in g["save_paths"])]
-        if new:
-            g["save_paths"] = g["save_paths"] + new
-            log(f"after {app}: first-play detection added {new}")
+        found = changed_dirs(snap.get("files", {}), after, snap.get("started", time.time()),
+                             roots, g.get("game_dir"))
         snap_file.unlink(missing_ok=True)
+        new = [d for d in found if d not in g.get("save_paths", [])]
+        g["suggested_paths"] = new
         save_json(REGISTRY, reg)
-        cmd_gen_config(quiet=True)
-        if g["save_paths"]:
-            notify(f"{title}: saves found (not confirmed yet)",
-                   "\n".join(g["save_paths"]) + f"\nChange with: savesync paths '{app}' --set …")
-        else:
-            notify(f"{title}: no save folder found", f"Set it with: savesync paths '{app}' --set <folder>")
+        log(f"after {app}: suggested save folders (NOT backed up until confirmed): {new}")
+        if new:
+            notify(f"{title}: where does it save?",
+                   "Suggested (not backed up yet):\n" + "\n".join(new) +
+                   f"\nPick: savesync paths '{app}' --add <folder>   (or --set)")
+        elif not g.get("save_paths"):
+            notify(f"{title}: no save folder found", f"Set it: savesync paths '{app}' --set <folder>")
     if not g.get("save_paths"):
         return
     r = backup([g["title"]])
@@ -794,6 +826,8 @@ def cmd_list(_args=None):
         for p in g.get("save_paths") or ["(no save folder yet)"]:
             exists = "" if p.startswith("(") or Path(p).exists() else "  (missing)"
             say(f"    {p}{exists}")
+        for p in g.get("suggested_paths", []):
+            say(f"    suggested, not backed up: {p}")
 
 
 def cmd_paths(args):
@@ -814,8 +848,21 @@ def cmd_paths(args):
         g["confirmed"] = True
     elif rest[0] == "--detect":
         g["save_paths"] = rule_paths(g)
-        g["confirmed"] = False   # watch the next play session again
+        g.pop("suggested_paths", None)
+        g["confirmed"] = False   # watch the next play session again (if no engine rule)
     elif rest[0] == "--confirm":
+        sug = g.get("suggested_paths", [])
+        if len(sug) > 1:
+            say("  More than one suggestion. Other apps may have written there too, so pick the right one(s):")
+            for d in sug:
+                say(f"    savesync paths '{app}' --add '{d}'")
+            return
+        for d in g.pop("suggested_paths", []):
+            n, size = dir_size(d)
+            if n > MAX_SUGGEST_FILES or size > MAX_SUGGEST_BYTES:
+                say(f"  skipped {d}: too big to be a save folder ({n}+ files, {size >> 20}+ MB)")
+            elif d not in g.get("save_paths", []):
+                g.setdefault("save_paths", []).append(d)
         g["confirmed"] = True
     else:
         raise SystemExit("usage: savesync paths <game> [--set P… | --add P | --detect | --confirm]")
