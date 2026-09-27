@@ -10,7 +10,8 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
                                      show / repick a game's save folders
   savesync backup [<game>…]          back up now (default: all)
   savesync sync [--pending] [<game>…]  sync now / push what was saved while offline
-  savesync login                     sign this device in (Google, once; opens the browser)
+  savesync login [--force]           sign this device in (Google, once; skipped if already valid)
+  savesync status                    is this device signed in?
   savesync devices [--revoke <id>]   signed-in devices; sign one out
   savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
   savesync gen-config                rewrite the Ludusavi config from the registry
@@ -421,10 +422,43 @@ def worker_cloud_env(c):
     }
 
 
-def cmd_login(_args=None):
+def session_status():
+    """'valid' | 'invalid' | 'missing' | 'unknown' (Worker unreachable)."""
+    c = settings().get("cloud") or {}
+    if not SESSION.exists() or not SESSION.read_text().strip():
+        return "missing"
+    try:
+        worker_call(c["url"].rstrip("/") + "/devices", token=SESSION.read_text().strip())
+        return "valid"
+    except SignedOut:
+        return "invalid"
+    except Offline:
+        return "unknown"
+
+
+def cmd_status(_args=None):
+    st = session_status()
+    say({"valid": f"signed in ({DEVICE})", "invalid": "signed out (session expired or revoked): savesync login",
+         "missing": "not signed in: savesync login",
+         "unknown": "can't reach the Worker right now; keeping the existing sign-in"}[st])
+    return st
+
+
+def cmd_login(args=None):
     c = settings().get("cloud") or {}
     if c.get("mode") != "worker":
         raise SystemExit("cloud isn't configured on this device (settings.json has no worker url)")
+    if "--force" not in (args or []):
+        st = session_status()
+        if st == "valid":
+            say(f"Already signed in ({DEVICE}). Use --force to sign in again.")
+            return
+        if st == "unknown":
+            say("Can't reach the Worker to check the existing sign-in; keeping it. Try again when online.")
+            return
+        if st == "invalid":
+            SESSION.unlink(missing_ok=True)
+            say("The saved sign-in expired or was revoked; signing in again.")
     base = c["url"].rstrip("/")
     p = secrets.token_urlsafe(32)
     h = hashlib.sha256(p.encode()).hexdigest()
@@ -1048,7 +1082,7 @@ COMMANDS = {
     "list": cmd_list, "paths": cmd_paths, "backup": cmd_backup,
     "setup-heroic": cmd_setup_heroic, "unhook-heroic": cmd_unhook_heroic,
     "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
-    "login": cmd_login, "devices": cmd_devices,
+    "login": cmd_login, "devices": cmd_devices, "status": cmd_status,
 }
 
 if __name__ == "__main__":

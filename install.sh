@@ -108,14 +108,19 @@ PY
   install -m644 "$REPO_ROOT"/systemd/save-sync-flush.* "$HOME/.config/systemd/user/"
   systemctl --user daemon-reload
   systemctl --user enable --now save-sync-flush.timer >/dev/null 2>&1 && ok "retry timer on (every 15 min)"
-  if [ -s "$HOME/.config/save-sync/session" ]; then
-    ok "this device is signed in"
-  elif [ "${NONINTERACTIVE:-0}" != "1" ]; then
-    log "Sign this device in with Google (once). A browser tab will open."
-    "$SAVESYNC" login || warn "Not signed in. Later: savesync login"
-  else
-    warn "Not signed in. Run: savesync login"
-  fi
+  # Ask the Worker, not just "does the file exist": a revoked/expired sign-in
+  # must re-open the browser, a valid one must never.
+  case "$("$SAVESYNC" status 2>/dev/null)" in
+    "signed in"*) ok "this device is signed in" ;;
+    "can't reach"*) warn "Worker unreachable; keeping the existing sign-in" ;;
+    *)
+      if [ "${NONINTERACTIVE:-0}" != "1" ]; then
+        log "Sign this device in with Google (once). A browser tab will open."
+        "$SAVESYNC" login || warn "Not signed in. Later: savesync login"
+      else
+        warn "Not signed in. Run: savesync login"
+      fi ;;
+  esac
 }
 
 steam_hint() {

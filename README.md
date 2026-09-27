@@ -42,6 +42,12 @@ savesync paths "<game>" --set /path/to/saves
 Repick a game's save folder (also `--add`, `--confirm`, `--detect`).
 
 ```sh
+savesync status
+```
+Is this device signed in? (Re-running the installer never asks you to sign in again while the
+sign-in is valid.)
+
+```sh
 savesync devices
 ```
 Signed-in devices; `savesync devices --revoke <id>` signs one out.
