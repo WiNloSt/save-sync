@@ -536,20 +536,20 @@ def put_head(env, title, head):
 
 
 def fingerprint(paths):
-    """Content hash of the live saves, independent of mtimes and device."""
+    """Content hash of the live saves. Keyed by (which save folder, path inside
+    it), so the same saves hash the same on devices whose game folders are named
+    differently (SpiderMan-1.0-pc on the PC, spiderman on the Deck)."""
     h = hashlib.sha256()
-    files = []
-    for p in paths:
-        p = Path(p)
-        if p.is_file():
-            files.append(p)
-        elif p.is_dir():
-            files += [f for f in p.rglob("*") if f.is_file()]
-    for f in sorted(set(files)):
-        h.update(str(f.relative_to(HOME) if str(f).startswith(str(HOME)) else f).encode())
-        h.update(b"\0")
-        h.update(hashlib.sha256(f.read_bytes()).digest())
-    return h.hexdigest() if files else "empty"
+    n = 0
+    for i, root in enumerate(paths):
+        root = Path(root)
+        files = [root] if root.is_file() else (sorted(f for f in root.rglob("*") if f.is_file())
+                                               if root.is_dir() else [])
+        for f in files:
+            rel = f.name if f == root else str(f.relative_to(root))
+            h.update(f"{i}:{rel}".encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
+            n += 1
+    return h.hexdigest() if n else "empty"
 
 
 def base_file(title):
