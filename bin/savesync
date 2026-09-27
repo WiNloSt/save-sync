@@ -447,7 +447,8 @@ def rclone(env, *args, check=True):
 def cloud_head(env, title):
     r = rclone(env, "cat", f"ss:games/{title}.head.json", check=False)
     if r.returncode == 0:
-        return json.loads(r.stdout)
+        # on S3/R2 a missing object gives exit 0 and no output
+        return json.loads(r.stdout) if r.stdout.strip() else None
     if "not found" in r.stderr.lower() or "doesn't exist" in r.stderr.lower() \
             or "no such file" in r.stderr.lower():
         return None

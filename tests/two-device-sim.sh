@@ -14,7 +14,13 @@ bad()  { echo "  FAIL $*"; fail=$((fail+1)); }
 mkdev() {  # mkdev A <game-folder>
   local d="$X/dev-$1"; mkdir -p "$d/.local/share/save-sync/bin" "$d/.config/save-sync" "$d/games/$2/saves"
   ln -s "$BIN/ludusavi" "$BIN/rclone" "$d/.local/share/save-sync/bin/"
-  echo "{\"cloud\": {\"mode\": \"local\", \"path\": \"$X/cloud\"}}" > "$d/.config/save-sync/settings.json"
+  if [ "${CLOUD:-local}" = worker ]; then
+    # real Worker + R2, reusing this machine's session (tests only; fake game "Sim Game")
+    echo "{\"cloud\": {\"mode\": \"worker\", \"url\": \"$WORKER_URL\"}}" > "$d/.config/save-sync/settings.json"
+    install -m600 "$HOME/.config/save-sync/session" "$d/.config/save-sync/session"
+  else
+    echo "{\"cloud\": {\"mode\": \"local\", \"path\": \"$X/cloud\"}}" > "$d/.config/save-sync/settings.json"
+  fi
   cat > "$d/.config/save-sync/games.json" <<J
 {"app-$1": {"title": "Sim Game", "runner": "sideload", "exec": "$H/games/$2/game.sh", "prefix": "",
   "game_dir": "$H/games/$2", "save_paths": ["$H/games/$2/saves"], "confirmed": true}}
@@ -44,11 +50,16 @@ found() {  # found <text> <dir> : any file (incl. inside backup zips) containing
 }
 slot() { cat "$X/dev-$1/games/$2/saves/slot1.sav" 2>/dev/null || echo "<none>"; }
 
+. "$REPO/cloud.env"
 mkdev A G-1.0; mkdev B G-1.0
 
 echo "1. A plays first → pushes"
 play A G-1.0 v1
-[ -f "$X/cloud/games/Sim Game.head.json" ] && ok "cloud has a head" || bad "no head in cloud"
+if [ "${CLOUD:-local}" = worker ]; then
+  grep -q "Sim Game: pushed to cloud" "$X/dev-A/.local/share/save-sync/logs/savesync.log" && ok "pushed to R2" || bad "no push"
+else
+  [ -f "$X/cloud/games/Sim Game.head.json" ] && ok "cloud has a head" || bad "no head in cloud"
+fi
 
 echo "2. fresh B launches → pulls A's save"
 play B G-1.0 ""
