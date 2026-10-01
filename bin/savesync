@@ -14,7 +14,7 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
   savesync history <game> [-n N]     who pushed / pulled / hit a conflict, from the cloud log
   savesync login [--force]           sign this device in (Google, once; skipped if already valid)
   savesync status                    is this device signed in?
-  savesync update                    install the latest version now (the timer does it daily)
+  savesync update                    install the latest version now (also checked at every launch)
   savesync devices [--revoke <id>]   signed-in devices; sign one out
   savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
   savesync gen-config                rewrite the Ludusavi config from the registry
@@ -976,12 +976,65 @@ def sync_after(g, why="after play"):
 
 REPO = "WiNloSt/save-sync"
 SRC = APP_HOME / "src"
-UPDATE_EVERY = 24 * 3600
+UPDATE_EVERY = 10 * 60   # i.e. every 15-min timer tick
+
+
+def latest_commit(timeout):
+    """main's commit sha: one request, a 40-byte answer (0.1-0.4 s). Unauthenticated
+    GitHub allows 60/h per IP; launches + 4 timer ticks/h per device stay well under."""
+    with urllib.request.urlopen(urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}/commits/main",
+            headers={"user-agent": "save-sync", "accept": "application/vnd.github.sha"}),
+            timeout=timeout) as r:
+        latest = r.read().decode().strip()
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "update-check").touch()
+    return latest if re.fullmatch(r"[0-9a-f]{40}", latest) else None
+
+
+def installed_commit():
+    return (SRC / ".commit").read_text().strip() if (SRC / ".commit").exists() else ""
+
+
+def install(latest, timeout=900):
+    """Download + install that commit (get.sh; 2-4 s so far). True if it worked."""
+    log(f"update: {installed_commit()[:7] or '?'} -> {latest[:7]}")
+    r = subprocess.run(["sh", "-c", f"curl -fsSL https://raw.githubusercontent.com/{REPO}/{latest}/get.sh | sh"],
+                       env={**os.environ, "SAVESYNC_REF": latest, "NONINTERACTIVE": "1"},
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        log(f"update: FAILED: {(r.stderr or r.stdout)[-500:]}")
+        return False
+    log(f"update: installed {latest[:7]}")
+    notify("save-sync updated", f"Now at {latest[:7]}.")
+    return True
+
+
+def check_failed(e, quiet):
+    # offline is normal (every timer tick, every offline launch): not worth a log line
+    if not (quiet and isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError)):
+        log(f"update: check failed ({e!r})")
+
+
+def update_before_launch():
+    """At every game launch: install a newer version first, so a fix applies to
+    this very launch. True if one was installed (the caller re-runs the hook with
+    it). Only for an installed copy (src/.commit), never a checkout or a test."""
+    if os.environ.get("SAVESYNC_UPDATED") or not installed_commit() \
+            or settings().get("auto_update", True) is False:
+        return False
+    try:
+        latest = latest_commit(timeout=3)     # offline: give up fast, don't hold the launch
+    except Exception as e:
+        check_failed(e, quiet=True)
+        return False
+    return bool(latest) and latest != installed_commit() and install(latest, timeout=120)
 
 
 def cmd_update(args=None):
     """Install the latest save-sync from GitHub if it's newer. `--auto`: at most
-    once a day, quietly, and only if settings allow (the timer calls this)."""
+    every UPDATE_EVERY, quietly, and only if settings allow (the timer calls this;
+    game launches check on their own, see update_before_launch)."""
     auto = "--auto" in (args or [])
     stamp = STATE / "update-check"
     if auto:
@@ -990,20 +1043,14 @@ def cmd_update(args=None):
         if stamp.exists() and time.time() - stamp.stat().st_mtime < UPDATE_EVERY:
             return
     try:
-        with urllib.request.urlopen(urllib.request.Request(
-                f"https://api.github.com/repos/{REPO}/commits/main",
-                headers={"user-agent": "save-sync", "accept": "application/vnd.github.sha"}),
-                timeout=15) as r:
-            latest = r.read().decode().strip()
+        latest = latest_commit(timeout=15)
     except Exception as e:
-        log(f"update: check failed ({e})")
+        check_failed(e, quiet=auto)
         if not auto:
             say(f"Couldn't check for updates: {e}")
         return
-    STATE.mkdir(parents=True, exist_ok=True)
-    stamp.touch()
-    current = (SRC / ".commit").read_text().strip() if (SRC / ".commit").exists() else ""
-    if not re.fullmatch(r"[0-9a-f]{40}", latest) or latest == current:
+    current = installed_commit()
+    if not latest or latest == current:
         if not auto:
             say(f"Up to date ({current[:7] or 'unknown'}).")
         return
@@ -1011,19 +1058,9 @@ def cmd_update(args=None):
         log("update: a game hook is running; will retry later")
         stamp.unlink(missing_ok=True)
         return
-    log(f"update: {current[:7] or '?'} -> {latest[:7]}")
-    r = subprocess.run(["sh", "-c", f"curl -fsSL https://raw.githubusercontent.com/{REPO}/{latest}/get.sh | sh"],
-                       env={**os.environ, "SAVESYNC_REF": latest, "NONINTERACTIVE": "1"},
-                       capture_output=True, text=True, timeout=900)
-    if r.returncode == 0:
-        log(f"update: installed {latest[:7]}")
-        notify("save-sync updated", f"Now at {latest[:7]}.")
-        if not auto:
-            say(f"Updated to {latest[:7]}.")
-    else:
-        log(f"update: FAILED: {(r.stderr or r.stdout)[-500:]}")
-        if not auto:
-            say("Update failed; see ~/.local/share/save-sync/logs/savesync.log")
+    ok = install(latest)
+    if not auto:
+        say(f"Updated to {latest[:7]}." if ok else "Update failed; see ~/.local/share/save-sync/logs/savesync.log")
 
 
 def cmd_sync(args):
@@ -1115,6 +1152,13 @@ def cmd_hook(args):
     if len(args) < 6:
         raise SystemExit("usage: savesync hook before|after <app> <title> <exec> <runner> <prefix>")
     stage, app, title, exe, runner, prefix = args[:6]
+    try:
+        if stage == "before" and update_before_launch():
+            # run this launch with the version just installed
+            new = str(HOME / ".local/bin/savesync")
+            os.execve(new, [new, "hook", *args], {**os.environ, "SAVESYNC_UPDATED": "1"})
+    except Exception as e:  # an update problem never blocks the game
+        log(f"update: at launch: {e!r}")
     try:
         (hook_before if stage == "before" else hook_after)(app, title, exe, runner, prefix)
     except Exception as e:  # never break a game launch

@@ -1,5 +1,5 @@
 [Unit]
-Description=save-sync: upload saves made while offline; daily self-update check
+Description=save-sync: upload saves made while offline; self-update check
 
 [Service]
 Type=oneshot
