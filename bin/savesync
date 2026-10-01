@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -965,6 +966,7 @@ def sync_after(g, why="after play"):
                 pending_file(title).unlink(missing_ok=True)
                 return
             why = "conflict: chose this device"
+        pending_file(title).write_text("push")  # if we're cut off anyway, the timer finishes it
         push(env, title, g, fp, why, head and head["fp"])
         set_base(title, fp)
         pending_file(title).unlink(missing_ok=True)
@@ -1077,7 +1079,7 @@ def cmd_sync(args):
             continue
         try:
             if state == "push" or not pending_only:
-                sync_after(g, "offline flush") if state == "push" else (sync_before(g), sync_after(g, "manual sync"))
+                sync_after(g, "pending upload") if state == "push" else (sync_before(g), sync_after(g, "manual sync"))
         except Offline as e:
             log(f"sync {title}: still offline ({e})")
         except Exception as e:
@@ -1152,6 +1154,11 @@ def cmd_hook(args):
     if len(args) < 6:
         raise SystemExit("usage: savesync hook before|after <app> <title> <exec> <runner> <prefix>")
     stage, app, title, exe, runner, prefix = args[:6]
+    # Closing Heroic (Steam's "Exit game" in Game Mode) SIGTERMs the hook script,
+    # and flatpak-spawn forwards that to us: the backup/upload died half-way.
+    # Finish regardless (the signal goes to this process only, not rclone/ludusavi).
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, signal.SIG_IGN)
     try:
         if stage == "before" and update_before_launch():
             # run this launch with the version just installed
