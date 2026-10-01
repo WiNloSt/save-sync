@@ -81,6 +81,7 @@ SAVESYNC_CONFLICT_CHOICE=cloud play A G-1.0 ""
 [ "$(slot A G-1.0)" = v3b ] && ok "chose cloud → A has v3b" || bad "A has $(slot A G-1.0)"
 q=$(found v3a "$X/dev-A/.local/share/save-sync/conflicts")
 [ -n "$q" ] && ok "A's v3a kept in conflicts/" || bad "v3a lost"
+[ -f "$X/dev-A/.local/share/save-sync/state/Sim Game.pending" ] && bad "pending left after choosing cloud" || ok "pending cleared"
 
 echo "5. conflict again, this time keep this device's save"
 SAVESYNC_OFFLINE=1 play A G-1.0 v4a
@@ -112,6 +113,45 @@ grep -q conflict "$X/dev-C/.local/share/save-sync/state/Sim Game.pending" 2>/dev
 grep -q "ERROR" "$X/dev-C/.local/share/save-sync/logs/savesync.log" && bad "hook errored" || ok "no hook error"
 play B G-1.1 ""
 [ "$(slot B G-1.1)" = v6 ] && ok "cloud untouched by C (B still v6)" || bad "B has $(slot B G-1.1)"
+
+# kdialog stand-ins: one that aborts like it did in Game Mode with no DISPLAY
+# (2026-10-01: that silently became 'Decide later'), one where the user picks.
+mkdir -p "$X/fakebin-crash" "$X/fakebin-cloud"
+printf '#!/bin/sh\necho "qt.qpa.xcb: could not connect to display" >&2\nkill -ABRT $$\n' > "$X/fakebin-crash/kdialog"
+printf '#!/bin/sh\nexit 0\n' > "$X/fakebin-cloud/kdialog"
+chmod +x "$X"/fakebin-*/kdialog
+CLOG="$X/dev-C/.local/share/save-sync/logs/savesync.log"
+EV="$X/cloud/events/Sim Game"
+
+echo "9. the dialog can't be shown (kdialog aborts) → treated as unresolved, said so in log + cloud"
+PATH="$X/fakebin-crash:$PATH" play C G-1.0 ""
+[ "$(slot C G-1.0)" = c-own ] && ok "C kept its own save" || bad "C has $(slot C G-1.0)"
+grep -q "kdialog failed (rc -6" "$CLOG" && ok "crash logged" || bad "crash not logged"
+grep -q "conflict before launch .* -> later (unavailable)" "$CLOG" && ok "logged as unavailable, not a user choice" || bad "no 'unavailable' in log"
+grep -lq '"how": "unavailable"' "$EV"/*-dev-C-conflict.json 2>/dev/null && ok "cloud event records it" || bad "no cloud conflict event"
+
+echo "10. the dialog works and the user picks the cloud save"
+PATH="$X/fakebin-cloud:$PATH" play C G-1.0 ""
+[ "$(slot C G-1.0)" = v6 ] && ok "C now has v6" || bad "C has $(slot C G-1.0)"
+[ -f "$X/dev-C/.local/share/save-sync/state/Sim Game.pending" ] && bad "pending left" || ok "pending cleared"
+
+echo "11. savesync resolve settles a conflict without the popup"
+SAVESYNC_OFFLINE=1 play C G-1.0 c2
+play B G-1.1 v7
+PATH="$X/fakebin-crash:$PATH" play C G-1.0 ""
+on C "$REPO/bin/savesync" resolve "Sim Game" local
+play B G-1.1 ""
+[ "$(slot B G-1.1)" = c2 ] && ok "resolve local → B has c2" || bad "B has $(slot B G-1.1)"
+
+echo "12. cloud event log + session metadata"
+n=$(ls "$EV" 2>/dev/null | grep -c -- '-push.json' || true)
+[ "$n" -ge 8 ] && ok "$n push events kept (push's rclone sync didn't wipe them)" || bad "only $n push events"
+python3 - "$X/cloud/games/Sim Game.head.json" <<'P' && ok "head has parent + session_start" || bad "head lacks session fields"
+import json, sys; h = json.load(open(sys.argv[1])); sys.exit(0 if h.get("parent") and h.get("session_start") else 1)
+P
+on A "$REPO/bin/savesync" history "Sim Game" -n 50 > "$X/history.txt"
+grep -q "dev-C .*conflict .*before launch: later (unavailable)" "$X/history.txt" && ok "history shows C's unseen dialog" \
+  || { bad "history output"; cat "$X/history.txt"; }
 
 echo; echo "passed $pass, failed $fail   (sandbox: $X)"
 [ "$fail" = 0 ]

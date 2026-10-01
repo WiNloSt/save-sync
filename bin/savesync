@@ -10,6 +10,8 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
                                      show / repick a game's save folders
   savesync backup [<game>…]          back up now (default: all)
   savesync sync [--pending] [<game>…]  sync now / push what was saved while offline
+  savesync resolve <game> cloud|local  settle a save conflict without the popup
+  savesync history <game> [-n N]     who pushed / pulled / hit a conflict, from the cloud log
   savesync login [--force]           sign this device in (Google, once; skipped if already valid)
   savesync status                    is this device signed in?
   savesync update                    install the latest version now (the timer does it daily)
@@ -31,6 +33,7 @@ import socket
 import subprocess
 import sys
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -345,8 +348,14 @@ def backup(titles):
 # ------------------------------------------------------------ cloud sync
 # Cloud layout (per game, by title):
 #   games/<title>/            mirror of the pushing device's Ludusavi backup dir
-#   games/<title>.head.json   {fp, device, time, game_dir}: what the cloud holds
-# Local: state/<title>.base.json = the fp both sides agreed on at the last sync.
+#   games/<title>.head.json   {fp, parent, device, time, save_time, session_start,
+#                             game_dir}: what the cloud holds, and what it was built on
+#   events/<title>/<utc>-<device>-<kind>.json   one object per push / pull / conflict
+#                             (`savesync history`). Outside games/<title>/, which push
+#                             mirrors with `rclone sync`.
+# Local: state/<title>.base.json = the fp both sides agreed on at the last sync;
+#        state/<title>.session.json = when this device's last play session started,
+#        and from which save (a device can sit asleep mid-game for days).
 # The glue owns direction (3-way: base / local / cloud); Ludusavi only makes and
 # restores backups.
 
@@ -572,6 +581,42 @@ def pending_file(title):
     return STATE / f"{title}.pending"
 
 
+def session_file(title):
+    return STATE / f"{title}.session.json"
+
+
+def get_session(title):
+    return load_json(session_file(title), {})
+
+
+def start_session(g):
+    STATE.mkdir(parents=True, exist_ok=True)
+    save_json(session_file(g["title"]), {"start": time.time(), "fp": fingerprint(g["save_paths"]),
+                                         "parent": get_base(g["title"]), "device": DEVICE})
+
+
+def code_version():
+    return (SRC / ".commit").read_text().strip()[:7] if (SRC / ".commit").exists() else "dev"
+
+
+def cloud_event(env, title, kind, **fields):
+    """Add one entry to the cloud's log for this game (one object per event: S3
+    has no append, and two devices never write the same name). Best-effort: a
+    failed log write never fails a sync."""
+    t = time.time()
+    name = f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime(t))}.{int(t * 1000) % 1000:03d}Z-{DEVICE}-{kind}.json"
+    tmp = STATE / f"{title}.event.json"
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"kind": kind, "device": DEVICE, "time": t,
+                                   "version": code_version(), **fields}))
+        rclone(env, "copyto", str(tmp), f"ss:events/{title}/{name}")
+    except Exception as e:
+        log(f"sync {title}: cloud event log failed ({e!r})")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def backup_dir(title):
     return BACKUPS / title
 
@@ -608,7 +653,7 @@ def entry_name(block):
     return re.match(r"  - name: (.+)", block).group(1).strip().strip('"')
 
 
-def pull(env, title, g, head):
+def pull(env, title, g, head, why, local_fp):
     """Cloud -> local backups -> live saves. Downloads only the cloud's newest
     backup and appends it to this device's own history (a fresh device used to
     fetch the whole history: 192 MB for 13 MB of saves). Ludusavi trims the
@@ -642,52 +687,197 @@ def pull(env, title, g, head):
     if r.returncode != 0:
         raise RuntimeError(f"restore failed: {r.stderr.strip()}")
     log(f"sync {title}: pulled from cloud (pushed by {head.get('device')} at "
-        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(head.get('time', 0)))})")
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(head.get('time', 0)))}; {why})")
+    cloud_event(env, title, "pull", why=why, fp=head.get("fp"), from_device=head.get("device"),
+                pushed=head.get("time"), replaced=local_fp)
 
 
-def push(env, title, g, fp):
+def push(env, title, g, fp, why, replaced=None):
+    """`replaced`: the cloud fp this overwrites (None: nothing / unknown)."""
     bdir = backup_dir(title)
     if not bdir.is_dir():
         return
     rclone(env, "sync", str(bdir), f"ss:games/{title}")
-    put_head(env, title, {"fp": fp, "device": DEVICE, "time": time.time(),
-                          "save_time": newest_local_mtime(g), "game_dir": g.get("game_dir")})
-    log(f"sync {title}: pushed to cloud")
+    head = {"fp": fp, "parent": get_base(title), "device": DEVICE, "time": time.time(),
+            "save_time": newest_local_mtime(g), "session_start": get_session(title).get("start"),
+            "game_dir": g.get("game_dir")}
+    put_head(env, title, head)
+    log(f"sync {title}: pushed to cloud ({why})")
+    cloud_event(env, title, "push", why=why, replaced=replaced,
+                **{k: head[k] for k in ("fp", "parent", "save_time", "session_start")})
 
 
 def newest_local_mtime(g):
+    """When the saves were last written. Skips Ren'Py's `persistent`, which the
+    game rewrites on every quit (even after days asleep without playing)."""
     m = 0
     for p in g.get("save_paths", []):
         p = Path(p)
         files = [p] if p.is_file() else (list(p.rglob("*")) if p.is_dir() else [])
-        m = max([m] + [f.stat().st_mtime for f in files if f.is_file()])
+        m = max([m] + [f.stat().st_mtime for f in files if f.is_file() and f.name != "persistent"])
     return m
 
 
+def gamescope_target():
+    """(DISPLAY, Steam app id) when Heroic runs in Game Mode, else None.
+
+    There Heroic is a Steam shortcut started as `reaper SteamLaunch AppId=N …
+    com.heroicgameslauncher.hgl`. gamescope only shows windows it can tie to the
+    focused app, which it does by walking a window's process tree up to that
+    reaper. Our dialog runs on the host (flatpak-spawn): outside that tree and
+    with no DISPLAY, so kdialog aborted and the conflict silently became 'later'.
+    Borrow the reaper's DISPLAY and tag the window STEAM_GAME=N instead."""
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv = (p / "cmdline").read_bytes().decode(errors="replace").split("\0")
+            if not argv[0].endswith("/reaper") or not any(HEROIC_APP in a for a in argv):
+                continue
+            appid = next((a[len("AppId="):] for a in argv if a.startswith("AppId=")), None)
+            env = dict(kv.split("=", 1) for kv in
+                       (p / "environ").read_bytes().decode(errors="replace").split("\0") if "=" in kv)
+        except OSError:
+            continue
+        if appid and env.get("DISPLAY"):
+            return env["DISPLAY"], appid
+    return None
+
+
+def tag_for_gamescope(proc, display, appid):
+    """Mark the dialog's windows as part of Heroic's Steam app so gamescope shows them."""
+    env = {**os.environ, "DISPLAY": display}
+    tagged = set()
+    try:
+        while proc.poll() is None:
+            r = subprocess.run(["xdotool", "search", "--pid", str(proc.pid)],
+                               env=env, capture_output=True, text=True)
+            for w in set(r.stdout.split()) - tagged:
+                subprocess.run(["xprop", "-id", w, "-f", "STEAM_GAME", "32c", "-set", "STEAM_GAME", appid],
+                               env=env, capture_output=True)
+                tagged.add(w)
+            time.sleep(0.3)
+    except OSError as e:
+        log(f"dialog: can't tag the window for Game Mode ({e})")
+
+
+def gamepad_to_keys(proc, display):
+    """kdialog can't read a controller, and in Game Mode there's no keyboard. Steam
+    keeps feeding its virtual Xbox pad (/dev/input/js*, readable by the seat user)
+    while our window is focused, so translate it: d-pad / left stick = previous /
+    next button, A = press, B = Escape ('Decide later')."""
+    import struct, select
+    fds = []
+    for path in glob.glob("/dev/input/js*"):
+        try:
+            fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    if not fds:
+        log("dialog: no readable gamepad (/dev/input/js*); touch / trackpad only")
+        return
+    env = {**os.environ, "DISPLAY": display}
+    key = lambda k: subprocess.run(["xdotool", "key", k], env=env, capture_output=True)
+    held = {}                                   # axis -> direction, until it recentres
+    try:
+        while proc.poll() is None:
+            for fd in select.select(fds, [], [], 0.3)[0]:
+                while True:
+                    try:
+                        _, value, kind, num = struct.unpack("IhBB", os.read(fd, 8))
+                    except (BlockingIOError, struct.error):
+                        break
+                    if kind & 0x80:                 # initial state, not a press
+                        continue
+                    if kind == 1 and value == 1:   # button down: 0 = A, 1 = B
+                        {0: lambda: key("space"), 1: lambda: key("Escape")}.get(num, lambda: None)()
+                    elif kind == 2 and num in (0, 1, 6, 7):   # stick x/y, d-pad x/y
+                        d = 1 if value > 16000 else -1 if value < -16000 else 0
+                        if abs(value) < 8000:
+                            held.pop(num, None)
+                        elif d and held.get(num) != d:
+                            held[num] = d
+                            # arrows, not Tab: Shift+Tab is Steam's overlay shortcut
+                            key("Right" if d > 0 else "Left")
+    except OSError as e:
+        log(f"dialog: gamepad input stopped ({e})")
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def run_dialog(args, timeout=600, gs=None):
+    """kdialog's exit code (0/1/2 = the three buttons), "timeout", or None when no
+    dialog could be shown (no display: kdialog aborts, rc < 0). gs: gamescope_target()."""
+    env = dict(os.environ)
+    if gs:
+        env.update(DISPLAY=gs[0], QT_QPA_PLATFORM="xcb")
+        env.pop("WAYLAND_DISPLAY", None)
+    try:
+        p = subprocess.Popen(["kdialog", *args], env=env, text=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:
+        log(f"dialog: can't run kdialog ({e})")
+        return None
+    if gs:
+        threading.Thread(target=tag_for_gamescope, args=(p, *gs), daemon=True).start()
+        threading.Thread(target=gamepad_to_keys, args=(p, gs[0]), daemon=True).start()
+    try:
+        _, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        return "timeout"
+    if p.returncode not in (0, 1, 2):
+        log(f"dialog: kdialog failed (rc {p.returncode}, {'Game Mode' if gs else 'desktop'}): "
+            f"{(err.strip().splitlines() or ['no output'])[0]}")
+        return None
+    return p.returncode
+
+
 def ask_conflict(title, head, local_fp, g=None):
-    """'cloud' | 'local' | 'later'. Steam-style prompt; falls back to newest-wins."""
+    """Steam-style prompt -> (choice, how). choice: 'cloud' | 'local' | 'later';
+    how: 'user' | 'forced' | 'timeout' | 'unavailable'. With no answer it is
+    'later' (play this device's save, upload nothing, ask again next launch),
+    never a guess: a device left asleep mid-game has the newest file times."""
     forced = os.environ.get("SAVESYNC_CONFLICT_CHOICE")
     if forced:
-        return forced
-    fmt = lambda t: time.strftime("%a %d %b %Y, %H:%M", time.localtime(t)) if t else "unknown"
+        return forced, "forced"
+    fmt = lambda t: time.strftime("%a %d %b, %H:%M", time.localtime(t)) if t else "unknown"
+    since = lambda t: f"\n      (session started {fmt(t)})" if t else ""
     cloud_t = head.get("save_time") or head.get("time", 0)   # when it was saved, not uploaded
-    local_t = newest_local_mtime(g or {})
-    newer = "cloud" if cloud_t > local_t else "this device"
+    gs = gamescope_target()
     text = (f"{title}: the cloud and this device both have saves the other hasn't seen.\n\n"
-            f"Cloud save:  {fmt(cloud_t)}  (from {head.get('device', '?')})\n"
-            f"This device: {fmt(local_t)}  ({DEVICE})\n\n"
-            f"Newer: {newer}.\n\n"
+            f"Cloud:  last save {fmt(cloud_t)} on {head.get('device', '?')}"
+            f"{since(head.get('session_start'))}\n"
+            f"This device:  last save {fmt(newest_local_mtime(g or {}))} on {DEVICE}"
+            f"{since(get_session(title).get('start'))}\n\n"
             f"Whichever you don't pick is kept in\n~/.local/share/save-sync/conflicts/\n"
-            f"'Decide later' plays this device's save and asks again next launch.")
-    try:
-        r = subprocess.run(["kdialog", "--title", f"save-sync: {title}", "--warningyesnocancel", text,
-                            "--yes-label", "Use cloud save", "--no-label", "Use this device's save",
-                            "--cancel-label", "Decide later"], timeout=600)
-        return {0: "cloud", 1: "local"}.get(r.returncode, "later")
-    except Exception as e:
-        log(f"sync {title}: conflict dialog failed ({e!r}); newest wins")
-        # both sides are quarantined before anything is overwritten
-        return "cloud" if (head.get("save_time") or head.get("time", 0)) >= newest_local_mtime(g or {}) else "local"
+            f"'Decide later' plays this device's save, uploads nothing, and asks again next launch."
+            + ("\n\nController: D-pad to pick, A to confirm, B = Decide later." if gs else ""))
+    rc = run_dialog(["--title", f"save-sync: {title}", "--warningyesnocancel", text,
+                     "--yes-label", "Use cloud save", "--no-label", "Use this device's save",
+                     "--cancel-label", "Decide later"], gs=gs)
+    if rc in (0, 1, 2):
+        return ("cloud", "local", "later")[rc], "user"
+    notify(f"{title}: save conflict, not resolved",
+           f"Playing this device's save; nothing uploaded. Resolve: savesync resolve '{title}' cloud|local")
+    return "later", "timeout" if rc == "timeout" else "unavailable"
+
+
+def record_conflict(env, title, when, choice, how, base, local_fp, head, g):
+    """Log + cloud event; keep the losing side (both, locally) unless deferred."""
+    log(f"sync {title}: conflict {when} (base={str(base)[:8]} local={local_fp[:8]} "
+        f"cloud={head['fp'][:8]} from {head.get('device')}) -> {choice} ({how})")
+    dest = None
+    if choice != "later":
+        dest = quarantine(title, g, f"conflict {when}; chose {choice} ({how})",
+                          env if choice == "local" else None)
+    cloud_event(env, title, "conflict", when=when, choice=choice, how=how, base=base,
+                local_fp=local_fp, local_session_start=get_session(title).get("start"),
+                cloud_fp=head["fp"], cloud_device=head.get("device"),
+                cloud_session_start=head.get("session_start"),
+                quarantine=str(dest) if dest else None)
 
 
 def sync_before(g):
@@ -715,39 +905,39 @@ def sync_before(g):
     local_changed = local_fp != base and local_fp != "empty"
     cloud_changed = cloud_fp != base
     if not local_changed:                      # only the cloud moved on (or first time here)
-        pull(env, title, g, head)
-        set_base(title, fingerprint(g["save_paths"]))
+        pull(env, title, g, head, "cloud moved on", local_fp)
         if fingerprint(g["save_paths"]) != cloud_fp:
             log(f"sync {title}: after pull, live fp differs from cloud fp (restore wrote other paths?)")
         set_base(title, cloud_fp)
+        pending_file(title).unlink(missing_ok=True)
         return
     if not cloud_changed:                      # only this device moved on (missed push)
-        push_now(env, title, g)
+        push_now(env, title, g, "missed push", cloud_fp)
         return
-    choice = ask_conflict(title, head, local_fp, g)
-    log(f"sync {title}: conflict (base={str(base)[:8]} local={local_fp[:8]} cloud={cloud_fp[:8]}) -> {choice}")
+    choice, how = ask_conflict(title, head, local_fp, g)
+    record_conflict(env, title, "before launch", choice, how, base, local_fp, head, g)
     if choice == "later":
         pending_file(title).write_text("conflict")
         return
-    quarantine(title, g, f"conflict before launch; chose {choice}", env if choice == "local" else None)
     if choice == "cloud":
-        pull(env, title, g, head)
+        pull(env, title, g, head, "conflict: chose cloud", local_fp)
         set_base(title, cloud_fp)
+        pending_file(title).unlink(missing_ok=True)
     else:
-        push_now(env, title, g)
+        push_now(env, title, g, "conflict: chose this device", cloud_fp)
 
 
-def push_now(env, title, g):
+def push_now(env, title, g, why, replaced):
     r = backup([title])
     if r.returncode != 0:
         raise RuntimeError(f"backup failed: {r.stderr.strip()}")
     fp = fingerprint(g["save_paths"])
-    push(env, title, g, fp)
+    push(env, title, g, fp, why, replaced)
     set_base(title, fp)
     pending_file(title).unlink(missing_ok=True)
 
 
-def sync_after(g):
+def sync_after(g, why="after play"):
     """After the game exits (backup already taken): publish if it changed."""
     title = g["title"]
     fp = fingerprint(g["save_paths"])
@@ -764,17 +954,18 @@ def sync_after(g):
         head = cloud_head(env, title)
         if head and head["fp"] not in (base, fp):
             # someone else pushed while we played
-            choice = ask_conflict(title, head, fp, g)
-            log(f"sync {title}: conflict after play -> {choice}")
+            choice, how = ask_conflict(title, head, fp, g)
+            record_conflict(env, title, "after play", choice, how, base, fp, head, g)
             if choice == "later":
                 pending_file(title).write_text("conflict")
                 return
-            quarantine(title, g, f"conflict after play; chose {choice}", env if choice == "local" else None)
             if choice == "cloud":
-                pull(env, title, g, head)
+                pull(env, title, g, head, "conflict: chose cloud", fp)
                 set_base(title, head["fp"])
+                pending_file(title).unlink(missing_ok=True)
                 return
-        push(env, title, g, fp)
+            why = "conflict: chose this device"
+        push(env, title, g, fp, why, head and head["fp"])
         set_base(title, fp)
         pending_file(title).unlink(missing_ok=True)
     except Offline as e:
@@ -849,13 +1040,74 @@ def cmd_sync(args):
             continue
         try:
             if state == "push" or not pending_only:
-                sync_after(g) if state == "push" else (sync_before(g), sync_after(g))
+                sync_after(g, "offline flush") if state == "push" else (sync_before(g), sync_after(g, "manual sync"))
         except Offline as e:
             log(f"sync {title}: still offline ({e})")
         except Exception as e:
             log(f"sync {title}: ERROR {e!r}")
     for f in STATE.glob("*.pending") if STATE.exists() else []:
         say(f"  pending: {f.stem} ({f.read_text()})")
+
+
+def cmd_resolve(args):
+    """Settle a pending conflict without the popup (e.g. it couldn't be shown)."""
+    if len(args) != 2 or args[1] not in ("cloud", "local"):
+        raise SystemExit("usage: savesync resolve <game> cloud|local")
+    g = registry()[find_game(registry(), args[0])]
+    os.environ["SAVESYNC_CONFLICT_CHOICE"] = args[1]
+    sync_before(g)
+    p = pending_file(g["title"])
+    say(f"{g['title']}: still pending ({p.read_text()})" if p.exists() else f"{g['title']}: in sync")
+
+
+def cmd_history(args):
+    """The cloud's event log for one game: who pushed / pulled / hit a conflict."""
+    n = 30
+    if "-n" in args:
+        i = args.index("-n")
+        n, args = int(args[i + 1]), args[:i] + args[i + 2:]
+    if len(args) != 1:
+        raise SystemExit("usage: savesync history <game> [-n N]")
+    reg = registry()
+    try:
+        title = reg[find_game(reg, args[0])]["title"]
+    except SystemExit:
+        title = args[0]                  # a game this device doesn't have
+    env = cloud_env()
+    if env is None:
+        raise SystemExit("cloud sync is not configured")
+    names = sorted(x for x in rclone(env, "lsf", f"ss:events/{title}", check=False).stdout.split("\n")
+                   if x.endswith(".json"))[-n:]
+    tmp = STATE / "history"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    (tmp / "list").write_text("\n".join(names) + "\n")
+    if names:
+        rclone(env, "copy", "--files-from-raw", str(tmp / "list"), f"ss:events/{title}", str(tmp / "ev"))
+    t = lambda x: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(x)) if x else "?"
+    f8 = lambda x: (x or "-")[:8]
+    for name in names:
+        e = load_json(tmp / "ev" / name, {})
+        k = e.get("kind")
+        if k == "push":
+            what = (f"{f8(e.get('fp'))} on top of {f8(e.get('parent'))}, replacing {f8(e.get('replaced'))}"
+                    f"  ({e.get('why')}; session started {t(e.get('session_start'))})")
+        elif k == "pull":
+            what = (f"{f8(e.get('fp'))} from {e.get('from_device')} (pushed {t(e.get('pushed'))}), "
+                    f"replacing {f8(e.get('replaced'))}  ({e.get('why')})")
+        elif k == "conflict":
+            what = (f"{e.get('when')}: {e.get('choice')} ({e.get('how')})  this device {f8(e.get('local_fp'))}"
+                    f" [session {t(e.get('local_session_start'))}] vs cloud {f8(e.get('cloud_fp'))} from "
+                    f"{e.get('cloud_device')} [session {t(e.get('cloud_session_start'))}], base {f8(e.get('base'))}")
+        else:
+            what = json.dumps(e)
+        say(f"{t(e.get('time'))}  {e.get('device', '?'):<12} {k:<9} {what}  [{e.get('version')}]")
+    if not names:
+        say(f"no events for {title} yet (the log starts with this version)")
+    head = cloud_head(env, title)
+    if head:
+        say(f"cloud now: {f8(head['fp'])} from {head.get('device')} at {t(head.get('time'))}")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------------------------------ hook (Heroic)
@@ -900,6 +1152,8 @@ def hook_before(app, title, exe, runner, prefix):
             cmd_gen_config(quiet=True)
         save_json(REGISTRY, reg)
     sync_before(g)
+    if g.get("save_paths"):
+        start_session(g)
     # Remember the state so the after-hook can tell which folders the game
     # wrote to (until the save folders are confirmed).
     if not g.get("confirmed") and not g.get("engine"):
@@ -1169,6 +1423,9 @@ def cmd_doctor(_args=None):
               f"{g['title']}: {len(paths)} save folder(s)", f"savesync paths '{app}' --set <folder>")
         if not g.get("confirmed"):
             print(f"  [ ] {g['title']}: save folders not confirmed yet (savesync paths '{app}' --confirm)")
+    for f in sorted(STATE.glob("*.pending")) if STATE.exists() else []:
+        if f.read_text() == "conflict":
+            check(False, f"{f.stem}: unresolved save conflict", f"savesync resolve '{f.stem}' cloud|local")
     print("  all good" if problems == 0 else f"  {problems} problem(s)")
     return problems == 0
 
@@ -1178,6 +1435,7 @@ COMMANDS = {
     "setup-heroic": cmd_setup_heroic, "unhook-heroic": cmd_unhook_heroic,
     "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
     "login": cmd_login, "devices": cmd_devices, "status": cmd_status, "update": cmd_update,
+    "resolve": cmd_resolve, "history": cmd_history,
 }
 
 if __name__ == "__main__":

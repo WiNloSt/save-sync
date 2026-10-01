@@ -60,6 +60,18 @@ savesync devices
 Signed-in devices; `savesync devices --revoke <id>` signs one out.
 
 ```sh
+savesync history "<game>"
+```
+The cloud's log for a game: which device pushed, pulled or hit a conflict, when, and from which
+save.
+
+```sh
+savesync resolve "<game>" cloud|local
+```
+Settle a save conflict without the popup. The popup also works in Game Mode: d-pad to pick,
+A to confirm, B = Decide later.
+
+```sh
 ~/.local/share/save-sync/src/install.sh --uninstall
 ```
 Remove save-sync (quit Heroic first, so its launch hooks can be removed). Your backups are kept.

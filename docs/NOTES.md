@@ -94,7 +94,30 @@
 - Pasted secrets can carry stray whitespace (a leading space in the Google Client ID broke
   sourcing .env). Values are trimmed on save.
 
-## Tested
+## Incident 2026-10-01: conflict popup never showed in Game Mode
+- A Deck left asleep mid-game for over a day while the PC played and pushed.
+  On exit, the conflict was detected correctly, but `kdialog` aborted (`qt.qpa.xcb: could not
+  connect to display`, rc −6). `{0,1}.get(rc, "later")` turned that into "Decide later", so it
+  played the Deck's stale save and asked "again" every launch, with no popup and no sign of it.
+  Nothing was overwritten in the cloud.
+- Why: hooks reach the host through `flatpak-spawn --host`, which has no `DISPLAY`. Even with
+  `DISPLAY=:1` (Heroic's Xwayland; `STEAM_MULTIPLE_XWAYLANDS=1`), gamescope only shows windows
+  it ties to the focused app. It finds that app by walking a window's process tree up to
+  `reaper SteamLaunch AppId=N`, and our host process isn't in that tree.
+- Fix (verified with a screenshot via `GAMESCOPECTRL_REQUEST_SCREENSHOT`): take `DISPLAY` and
+  `AppId` from that reaper process and set `STEAM_GAME=N` on the dialog's windows
+  (`xdotool search --pid`, `xprop -set`). gamescope then focuses the dialog over Heroic.
+- Controller: kdialog only takes keyboard and mouse, and Game Mode has no keyboard (only the
+  trackpad worked, with Steam held). Steam keeps feeding its virtual Xbox pad (`/dev/input/js0`,
+  user-readable) to the focused window, so while the dialog is up savesync turns it into keys
+  with `xdotool`: d-pad / stick → Left / Right, A → Space, B → Escape ("Decide later"). Not
+  Tab: **Shift+Tab is Steam's overlay shortcut** and opened the sidebar. Verified on the Deck.
+- A dialog that can't be shown is now logged as `(unavailable)`, never as a user choice. It is
+  also never "newest wins": the asleep Deck had the newest file times (an autosave at quit,
+  plus Ren'Py rewriting `persistent`) while holding the older progress.
+- Every push / pull / conflict now goes to `events/<title>/` in the cloud (`savesync
+  history`). Heads carry `parent` and `session_start`.
+
 - 2026-09-27, through real Heroic, never-seen fake game: the before-hook registered it, the
   first play session detected `…/config/FakeCo/FakeGame` (the `.log` was filtered), and the
   after-hook backed it up. It also wrongly picked the game's own folder, because the test
