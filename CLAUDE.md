@@ -19,13 +19,17 @@ design, `docs/NOTES.md` the findings log, and `README.md` the user-facing docs.
 
 ## Layout
 - `bin/savesync`: the whole host-side program (Python, stdlib only, `#!/usr/bin/python3`).
-- `install.sh`: idempotent installer and repairer; `get.sh` is the curl bootstrap that pins a
-  commit. `savesync update` reuses it with `NONINTERACTIVE=1`.
+- `install.sh`: the one-command, idempotent device setup and repair: Heroic (installed if
+  missing, started once for its config), hooks, binaries, sign-in, timer, and Heroic's Steam
+  shortcut (asks first, remembers a "no"). `get.sh` is the curl bootstrap that pins a commit.
+  `savesync update` reuses it with `NONINTERACTIVE=1`, which never installs apps or adds
+  shortcuts. It only repairs what's there.
 - `worker/`: the Cloudflare Worker (auth + key release). Deployed separately (`worker/deploy.sh`).
 - `systemd/`: a 15-minute timer that uploads pending saves and checks for updates.
 - `tests/two-device-sim.sh`: two or three simulated devices plus a local-folder "cloud" on one
   machine. Run it after any sync change: `bash tests/two-device-sim.sh <scratch dir>`.
-  `tests/detection-test.sh` covers first-play save-folder detection.
+  `tests/detection-test.sh` covers first-play save-folder detection, and
+  `tests/steam-shortcut-test.sh` covers adding and wrapping the Steam shortcut offline.
 
 ## Sync model
 - 3-way: `state/<title>.base.json` (the fp both sides agreed on) vs. local fp vs. the cloud

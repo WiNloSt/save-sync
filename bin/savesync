@@ -17,7 +17,8 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
   savesync update                    install the latest version now (also checked at every launch)
   savesync devices [--revoke <id>]   signed-in devices; sign one out
   savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
-  savesync setup-steam [--remove]    make Steam wait for save-sync when Heroic exits (Game Mode)
+  savesync setup-steam [--add|--remove]  make Steam wait for save-sync when Heroic exits
+                                     (--add: also add Heroic to Steam if it isn't there)
   savesync heroic-exited             finish syncing after Heroic closes (Steam wrapper runs it)
   savesync gen-config                rewrite the Ludusavi config from the registry
   savesync doctor                    check everything is wired up
@@ -44,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+import zlib
 from pathlib import Path
 
 HOME = Path.home()
@@ -1356,6 +1358,72 @@ def sc_name(sc):
     return sc.get("AppName") or sc.get("appname") or str(sc.get("appid"))
 
 
+HEROIC_SHORTCUT_NAME = "Heroic Games Launcher"
+# what Steam's "Add a Non-Steam Game" writes for Heroic's .desktop entry
+HEROIC_SHORTCUT_OPTS = ('"run" "--branch=stable" "--arch=x86_64" "--command=heroic-run" '
+                        '"--file-forwarding" "com.heroicgameslauncher.hgl" "@@u" "@@"')
+
+
+def steam_running():
+    return subprocess.run(["pgrep", "-f", "ubuntu12_32/steam"], capture_output=True).returncode == 0
+
+
+def steam_user_dir():
+    """userdata/<account> of the account that used Steam last."""
+    dirs = [d for d in STEAM_USERDATA.glob("*") if d.name.isdigit() and d.name != "0" and (d / "config").is_dir()]
+    lc = lambda d: (d / "config/localconfig.vdf").stat().st_mtime if (d / "config/localconfig.vdf").exists() else 0
+    return max(dirs, key=lc, default=None)
+
+
+def add_heroic_shortcut():
+    """Add Heroic to Steam, already wrapped. Live through the Steam client when
+    reachable (it saves shortcuts.vdf within a second), else straight into
+    shortcuts.vdf while Steam is closed. Returns (ok, message)."""
+    opts = wrapped_options(HEROIC_SHORTCUT_OPTS)
+    try:
+        q = json.dumps
+        appid = int(steam_js(f"SteamClient.Apps.AddShortcut({q('Heroic')}, {q('/usr/bin/flatpak')}, "
+                             f"{q('/usr/bin/')}, {q('')})"))
+        # AddShortcut names it after the exe and ignores the rest: set each field
+        for fn, arg in (("SetShortcutName", HEROIC_SHORTCUT_NAME), ("SetShortcutStartDir", "/usr/bin/"),
+                        ("SetShortcutLaunchOptions", opts)):
+            steam_js(f"SteamClient.Apps.{fn}({appid}, {q(arg)})")
+        time.sleep(2)                                # let Steam write shortcuts.vdf
+        return True, "added Heroic to Steam"
+    except Exception:
+        pass                                         # Steam closed, or no CEF debug port
+    if steam_running():
+        return False, ("Steam is running and can't be changed live. Quit Steam (Steam → Exit) and run "
+                       "`savesync setup-steam --add`, or add it by hand: Steam → Add a Game → "
+                       "Add a Non-Steam Game → Heroic Games Launcher, then `savesync setup-steam`.")
+    user = steam_user_dir()
+    if user is None:
+        return False, "Steam has no account folder yet: sign in to Steam once, then re-run."
+    f = user / "config/shortcuts.vdf"
+    raw = f.read_bytes() if f.exists() else None
+    d = vdf_load(raw)[0] if raw else {"shortcuts": {}}
+    if raw and vdf_dump(d) != raw:
+        return False, f"{f} isn't in a format save-sync can safely rewrite; add Heroic by hand."
+    exe = '"/usr/bin/flatpak"'
+    desktop = next((str(p) for p in (Path("/var/lib/flatpak/exports/share/applications"),
+                                     HOME / ".local/share/flatpak/exports/share/applications")
+                    if (p / f"{HEROIC_APP}.desktop").exists()), "")
+    shortcuts = d.setdefault("shortcuts", {})
+    shortcuts[str(max((int(k) for k in shortcuts if k.isdigit()), default=-1) + 1)] = {
+        "appid": zlib.crc32((exe + HEROIC_SHORTCUT_NAME).encode()) | 0x80000000,   # Steam's scheme
+        "appname": HEROIC_SHORTCUT_NAME, "Exe": exe, "StartDir": "/usr/bin/", "icon": "",
+        "ShortcutPath": f"{desktop}/{HEROIC_APP}.desktop" if desktop else "", "LaunchOptions": opts,
+        "IsHidden": 0, "AllowDesktopConfig": 1, "AllowOverlay": 1, "OpenVR": 0, "Devkit": 0,
+        "DevkitGameID": "", "DevkitOverrideAppID": 0, "LastPlayTime": 0, "FlatpakAppID": "",
+        "sortas": "", "tags": {}}
+    if raw:
+        shutil.copy2(f, f.with_suffix(".vdf.savesync-backup"))
+    tmp = f.with_suffix(".vdf.savesync")
+    tmp.write_bytes(vdf_dump(d))
+    tmp.replace(f)
+    return True, "added Heroic to Steam (shows up when Steam starts)"
+
+
 def wrapped_options(opts, remove=False):
     plain = opts
     for w in [STEAM_WRAP, *STEAM_WRAP_OLD]:
@@ -1369,6 +1437,7 @@ def cmd_setup_steam(args=None, quiet=False):
     Live through the Steam client when it's reachable (no restart), and in
     shortcuts.vdf so it survives a Steam restart either way."""
     remove = "--remove" in (args or [])
+    add = "--add" in (args or [])
     out = (lambda m: log(m)) if quiet else say
     if not remove:
         APP_HOME.mkdir(parents=True, exist_ok=True)
@@ -1376,9 +1445,13 @@ def cmd_setup_steam(args=None, quiet=False):
             STEAM_WRAPPER.write_text(steam_wrapper_script())
             STEAM_WRAPPER.chmod(0o755)
     found = heroic_shortcuts()
+    if not found and add and not remove:
+        ok, msg = add_heroic_shortcut()
+        out(f"setup-steam: {msg}")
+        return ok
     if not found:
         if not quiet:
-            say("No Heroic shortcut in Steam (only needed for Game Mode).")
+            say("No Heroic shortcut in Steam (only needed for Game Mode; `savesync setup-steam --add`).")
         return True
     changed = {}
     for f, d, sc in found:
@@ -1779,5 +1852,5 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     res = COMMANDS[sys.argv[1]](sys.argv[2:])
-    if sys.argv[1] == "doctor" and res is False:
+    if sys.argv[1] in ("doctor", "setup-steam") and res is False:
         sys.exit(1)

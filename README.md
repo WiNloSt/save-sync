@@ -13,13 +13,16 @@ In **Desktop Mode**, open **Konsole** and run:
 curl -fsSL https://raw.githubusercontent.com/WiNloSt/save-sync/main/get.sh | sh
 ```
 
-Then:
-1. A browser tab opens: sign in with Google (once per device). Google warns the app isn't
-   verified, because it's a private app in testing mode. Click **Continue**.
-2. For Gaming Mode, add Heroic to Steam once: Steam → **Add a Game → Add a Non-Steam Game** →
-   tick **Heroic Games Launcher**.
-3. Add games with Heroic's own **Add Game** button and play them from Heroic. Each game's save
-   folder is found on its first launch.
+That one line sets up everything, and running it again only repairs what's missing:
+- **Heroic**: installed from Flathub if missing, its launch hooks wired to save-sync.
+- **Sign-in**: a browser tab opens; sign in with Google (once per device). Google warns the
+  app isn't verified, because it's a private app in testing mode. Click **Continue**.
+- **Game Mode**: it offers to add Heroic to Steam, set up so that closing it waits for your
+  saves to upload. If Steam is open and can't be changed live, it tells you to quit Steam
+  and re-run.
+
+Then add games with Heroic's own **Add Game** button and play them from Heroic. Each game's
+save folder is found on its first launch.
 
 It installs the latest `main` branch into your home folder, so SteamOS updates don't touch it.
 It **updates itself**: at every game launch (before the game starts, so a fix applies right

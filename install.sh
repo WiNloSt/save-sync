@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # install.sh — save-sync: Steam-Cloud-style saves for non-Steam games on SteamOS.
 #
-# Idempotent; run it on every device (this PC, the Deck, future SteamOS PCs)
-# and again after a SteamOS update (`savesync doctor` tells you if you need to).
+# One command sets up a device: Heroic (installed if missing), its launch hooks,
+# save-sync itself, cloud sign-in, and Heroic's Steam shortcut for Game Mode.
+# Idempotent: every step checks first, so re-running repairs and never
+# duplicates. Run it again after a SteamOS update (`savesync doctor` tells you).
 # Everything lives under $HOME, so atomic OS updates don't touch it.
 #
 # Usage:
@@ -21,6 +23,7 @@ source "$REPO_ROOT/versions.env"
 APP_HOME="$HOME/.local/share/save-sync"
 CACHE="$HOME/.cache/save-sync"
 HEROIC_APP=com.heroicgameslauncher.hgl
+HEROIC_CONFIG="$HOME/.var/app/$HEROIC_APP/config/heroic/config.json"
 SAVESYNC="$HOME/.local/bin/savesync"
 
 install_binaries() {
@@ -51,10 +54,37 @@ install_cli() {
   case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not on PATH in this shell";; esac
 }
 
+heroic_install() {
+  step "Heroic Games Launcher"
+  if flatpak info "$HEROIC_APP" >/dev/null 2>&1; then ok "installed"; return 0; fi
+  if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+    warn "Heroic isn't installed; re-run the install line to add it"; return 1
+  fi
+  log "Installing Heroic from Flathub (for this user)…"
+  flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+  flatpak install --user -y --noninteractive flathub "$HEROIC_APP" && ok "installed"
+}
+
+heroic_first_run() {
+  # Heroic writes config.json (where its launch hooks go) on first start: ~3 s.
+  [ -f "$HEROIC_CONFIG" ] && return 0
+  flatpak info "$HEROIC_APP" >/dev/null 2>&1 || return 1
+  [ "${NONINTERACTIVE:-0}" = "1" ] && return 1
+  flatpak ps --columns=application 2>/dev/null | grep -qx "$HEROIC_APP" && return 1
+  log "Starting Heroic once so it creates its settings (it closes again by itself)…"
+  flatpak run "$HEROIC_APP" >/dev/null 2>&1 &
+  local i
+  for i in $(seq 60); do [ -f "$HEROIC_CONFIG" ] && break; sleep 1; done
+  sleep 3                                   # let it finish writing
+  flatpak kill "$HEROIC_APP" 2>/dev/null || true
+  for i in $(seq 10); do flatpak ps --columns=application | grep -qx "$HEROIC_APP" || break; sleep 1; done
+  [ -f "$HEROIC_CONFIG" ] && ok "Heroic settings created" || { warn "Heroic didn't create its settings"; return 1; }
+}
+
 heroic_sandbox() {
   step "Heroic sandbox"
   if ! flatpak info "$HEROIC_APP" >/dev/null 2>&1; then
-    warn "Heroic isn't installed. Install it: flatpak install flathub $HEROIC_APP  — then re-run."
+    warn "Heroic isn't installed: skipped"
     return 1
   fi
   # - talk-name: the hook script runs savesync on the host (flatpak-spawn --host)
@@ -123,20 +153,35 @@ PY
   esac
 }
 
-steam_hint() {
-  local vdf
-  for vdf in "$HOME"/.local/share/Steam/userdata/*/config/shortcuts.vdf; do
-    if [ -f "$vdf" ] && grep -qa "$HEROIC_APP" "$vdf"; then
-      ok "Heroic is already in Steam (Gaming Mode)"
-      # its shortcut launches through `savesync steam-wrap`, so closing Heroic
-      # shows "Exiting…" until save-sync has finished uploading
-      "$SAVESYNC" setup-steam && ok "Steam waits for save-sync when Heroic exits" || true
-      return
+steam_shortcut() {
+  # Game Mode: Heroic as a Steam shortcut, launched through save-sync's wrapper so
+  # closing it shows "Exiting…" until saves are uploaded.
+  [ -d "$HOME/.local/share/Steam/userdata" ] || return 0      # no Steam on this machine
+  step "Steam (Game Mode)"
+  if "$SAVESYNC" setup-steam 2>/dev/null | grep -q "No Heroic shortcut"; then
+    local want
+    want="$(/usr/bin/python3 -c 'import json,pathlib;p=pathlib.Path.home()/".config/save-sync/settings.json";print(json.loads(p.read_text()).get("steam_shortcut","ask") if p.exists() else "ask")')"
+    if [ "$want" = "no" ]; then
+      ok "Heroic isn't in Steam (you chose that; add it: savesync setup-steam --add)"; return 0
     fi
-  done
-  step "One manual step for Gaming Mode"
-  log "Steam → Add a Game → Add a Non-Steam Game → tick 'Heroic Games Launcher'."
-  log "That's the only Steam shortcut you need; pick games inside Heroic."
+    if [ "${NONINTERACTIVE:-0}" = "1" ]; then return 0; fi
+    read -r -p "Add Heroic to Steam so you can play from Game Mode? [Y/n] " a || true
+    case "${a:-y}" in
+      n|N)
+        /usr/bin/python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".config/save-sync/settings.json"
+s = json.loads(p.read_text()) if p.exists() else {}
+s["steam_shortcut"] = "no"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(s, indent=2) + "\n")
+PY
+        ok "skipped (later: savesync setup-steam --add)"; return 0 ;;
+    esac
+    "$SAVESYNC" setup-steam --add && ok "Heroic is in Steam; closing it waits for save-sync" || warn "see above"
+  else
+    ok "Heroic is in Steam; closing it waits for save-sync"
+  fi
 }
 
 uninstall() {
@@ -161,11 +206,13 @@ main() {
   esac
   install_binaries
   install_cli
+  heroic_install || true
+  heroic_first_run || true
   heroic_sandbox || true
   heroic_hooks || true
   cloud_setup
   register_games
-  steam_hint
+  steam_shortcut
   step "Doctor"
   "$SAVESYNC" doctor || true
   step "Done"

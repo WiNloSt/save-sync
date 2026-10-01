@@ -141,6 +141,16 @@
   Game Mode launch without the wrapper re-applies it for next time.
 - Measured on the Deck: quit, then Exit game → held 3 s until the upload finished. Killed
   mid-game → the open session was backed up and uploaded, and Steam waited ~6 s for it.
+- Adding the shortcut live: `SteamClient.Apps.AddShortcut(name, exe, startDir, opts)` returns
+  the app id, but names the shortcut after the exe and ignores startDir and opts. Set them with
+  `SetShortcutName` / `SetShortcutStartDir` / `SetShortcutLaunchOptions`. Pass the exe
+  unquoted, because Steam adds the quotes. Steam writes shortcuts.vdf within a second, so
+  re-runs see it and never add a duplicate.
+- With Steam closed, the installer writes the entry into shortcuts.vdf itself (appid =
+  `crc32(exe + name) | 0x80000000`). With Steam open and no CEF port, it changes nothing and
+  asks the user to quit Steam and re-run.
+- Heroic writes `config.json` (where the hooks go) about 3 s after its first start, without
+  any clicks. The installer starts it once on a fresh device, then closes it.
 
 ## Tested
 - 2026-09-27, through real Heroic, never-seen fake game: the before-hook registered it, the
