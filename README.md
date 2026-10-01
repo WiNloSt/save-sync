@@ -72,6 +72,10 @@ savesync resolve "<game>" cloud|local
 Settle a save conflict without the popup. The popup also works in Game Mode: d-pad to pick,
 A to confirm, B = Decide later.
 
+In Game Mode, closing Heroic (even killing the game from Steam) shows **Exiting…** until your
+saves are uploaded. The installer sets this up on Heroic's Steam shortcut; `savesync setup-steam`
+redoes it, `savesync setup-steam --remove` undoes it.
+
 ```sh
 ~/.local/share/save-sync/src/install.sh --uninstall
 ```

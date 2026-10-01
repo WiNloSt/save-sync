@@ -118,6 +118,31 @@
 - Every push / pull / conflict now goes to `events/<title>/` in the cloud (`savesync
   history`). Heads carry `parent` and `session_start`.
 
+## Steam waits for save-sync when Heroic closes (Game Mode, 2026-10-01)
+- flatpak-spawn **does** forward SIGTERM from the sandbox to the host process. Closing Heroic
+  killed an upload half-way, so hooks now ignore TERM/HUP/INT. The signal reaches savesync
+  only, not the rclone/ludusavi it runs.
+- Hooks run on the host via flatpak-spawn, outside Steam's process tree. So "Exit game"
+  returned at once while the upload was still running, with nothing on screen. Sleeping the
+  Deck right then could cut the upload off.
+- Steam counts a game as running until every process it started has exited. It never signals
+  the top one: a test wrapper that outlived Heroic by 30 s kept "Exiting…" up for all 30 s,
+  with no kill. With `%command%`, a non-Steam shortcut's launch option wraps the whole chain
+  (`steam-launch-wrapper → reaper → flatpak run`).
+- So Heroic's shortcuts launch through `~/.local/share/save-sync/steam-wrap.sh %command% …`.
+  When Heroic exits, the wrapper runs `savesync heroic-exited`, which waits for the hook lock
+  (hooks hold `state/hook.lock` shared). It also finishes any session whose after-hook never
+  ran: killing the game from Steam takes Heroic down before it runs its after-script.
+- The wrapper is plain sh, not savesync. A launch-time update once replaced a test build with
+  a version that lacked the wrapper command, which would have stopped Heroic from launching.
+- `savesync setup-steam` sets the launch option, live through Steam's CEF debug port
+  (`SteamClient.Apps.SetShortcutLaunchOptions`, open when Decky is installed) and in
+  shortcuts.vdf (written only if it round-trips byte for byte). The installer runs it, and a
+  Game Mode launch without the wrapper re-applies it for next time.
+- Measured on the Deck: quit, then Exit game → held 3 s until the upload finished. Killed
+  mid-game → the open session was backed up and uploaded, and Steam waited ~6 s for it.
+
+## Tested
 - 2026-09-27, through real Heroic, never-seen fake game: the before-hook registered it, the
   first play session detected `…/config/FakeCo/FakeGame` (the `.log` was filtered), and the
   after-hook backed it up. It also wrongly picked the game's own folder, because the test
@@ -128,5 +153,5 @@
 - First play: save dir mapped automatically, config regenerated, backup made.
 - SIGTERM to savesync (what Steam's "Exit game" sends): passed to the game's process group, the
   game saved on TERM, backup ran afterwards, exit code 143 passed through.
-- Not yet tested on hardware: a real overlay quit in Gaming Mode (does flatpak-spawn pass
-  SIGTERM from the sandbox to the host?). That's a phase-0 spike.
+- Answered 2026-10-01: flatpak-spawn does pass SIGTERM from the sandbox to the host (see the
+  Steam section above).

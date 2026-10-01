@@ -153,5 +153,17 @@ on A "$REPO/bin/savesync" history "Sim Game" -n 50 > "$X/history.txt"
 grep -q "dev-C .*conflict .*before launch: later (unavailable)" "$X/history.txt" && ok "history shows C's unseen dialog" \
   || { bad "history output"; cat "$X/history.txt"; }
 
+echo "13. Steam kills the game mid-play: Heroic's after-hook never runs → the Steam wrapper finishes it"
+kill_mid_game() { ss hook before "app-$DEV" "Sim Game" "$H/games/$GAMEDIR/game.sh" sideload ""; \
+                  echo "$WRITE" > "$H/games/$GAMEDIR/saves/slot1.sav"; }   # ...and no "hook after"
+sleep 1
+DEV=A GAMEDIR=G-1.0 WRITE=killed on A bash -c "$(declare -f ss kill_mid_game); REPO='$REPO' H='$H' DEV=A GAMEDIR=G-1.0 WRITE=killed kill_mid_game"
+on A "$REPO/bin/savesync" heroic-exited
+grep -q "after-hook never ran" "$X/dev-A/.local/share/save-sync/logs/savesync.log" && ok "open session noticed" || bad "open session not noticed"
+play B G-1.1 ""
+[ "$(slot B G-1.1)" = killed ] && ok "the killed session's save reached B" || bad "B has $(slot B G-1.1)"
+on A "$REPO/bin/savesync" heroic-exited
+[ "$(grep -c "after-hook never ran" "$X/dev-A/.local/share/save-sync/logs/savesync.log")" = 1 ] && ok "finished once, not again" || bad "finished twice"
+
 echo; echo "passed $pass, failed $fail   (sandbox: $X)"
 [ "$fail" = 0 ]

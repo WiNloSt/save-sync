@@ -17,12 +17,16 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
   savesync update                    install the latest version now (also checked at every launch)
   savesync devices [--revoke <id>]   signed-in devices; sign one out
   savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
+  savesync setup-steam [--remove]    make Steam wait for save-sync when Heroic exits (Game Mode)
+  savesync heroic-exited             finish syncing after Heroic closes (Steam wrapper runs it)
   savesync gen-config                rewrite the Ludusavi config from the registry
   savesync doctor                    check everything is wired up
   savesync hook before|after <app> <title> <exec> <runner> <prefix>   (Heroic calls this)
 
 <game> is the Heroic app name (see `savesync list`) or the title.
 """
+import base64
+import fcntl
 import glob
 import hashlib
 import json
@@ -32,6 +36,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import struct
 import sys
 import secrets
 import threading
@@ -59,6 +64,11 @@ HEROIC_LIBRARY = HEROIC_CFG / "sideload_apps/library.json"
 HEROIC_GAMESCONFIG = HEROIC_CFG / "GamesConfig"
 HOOK_DIR = HOME / "Games/Heroic/save-sync"          # inside Heroic's sandbox grant
 HOOK = HOOK_DIR / "hook.sh"
+HOOK_LOCK = STATE / "hook.lock"   # held (shared) while a hook works
+STEAM_USERDATA = HOME / ".local/share/Steam/userdata"
+STEAM_WRAPPER = APP_HOME / "steam-wrap.sh"
+STEAM_WRAP = f"{STEAM_WRAPPER} %command%"
+STEAM_WRAP_OLD = [f"{HOME}/.local/bin/savesync steam-wrap %command%"]   # earlier forms, unwrapped on setup
 TOKENS_GAME = "Ren'Py security tokens"
 RETENTION_FULL = 5
 RCLONE = APP_HOME / "bin/rclone"
@@ -593,7 +603,29 @@ def get_session(title):
 def start_session(g):
     STATE.mkdir(parents=True, exist_ok=True)
     save_json(session_file(g["title"]), {"start": time.time(), "fp": fingerprint(g["save_paths"]),
-                                         "parent": get_base(g["title"]), "device": DEVICE})
+                                         "parent": get_base(g["title"]), "device": DEVICE, "open": True})
+
+
+def end_session(title):
+    sess = get_session(title)
+    if sess.get("open"):
+        save_json(session_file(title), {**sess, "open": False, "end": time.time()})
+
+
+def finish_open_sessions(why):
+    """Play sessions whose after-hook never ran: Steam's "Exit game" / kill while
+    the game was up takes Heroic down with it, and Heroic's after-script with
+    it. Back up and upload them now (the saves the game wrote are on disk)."""
+    for g in registry().values():
+        if not g.get("save_paths") or not get_session(g["title"]).get("open"):
+            continue
+        title = g["title"]
+        log(f"sync {title}: the session's after-hook never ran ({why}); finishing it")
+        end_session(title)
+        if backup([title]).returncode != 0:
+            log(f"sync {title}: backup failed while finishing the session")
+            continue
+        sync_after(g, why)
 
 
 def code_version():
@@ -1084,6 +1116,11 @@ def cmd_sync(args):
             log(f"sync {title}: still offline ({e})")
         except Exception as e:
             log(f"sync {title}: ERROR {e!r}")
+    if pending_only and not heroic_running():
+        try:
+            finish_open_sessions("Heroic closed while the game ran; found by the timer")
+        except Offline as e:
+            log(f"sync: still offline ({e})")
     for f in STATE.glob("*.pending") if STATE.exists() else []:
         say(f"  pending: {f.stem} ({f.read_text()})")
 
@@ -1149,6 +1186,245 @@ def cmd_history(args):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ------------------------------------------------------------ Steam (Game Mode)
+# Closing Heroic from Steam returns at once while save-sync may still be
+# uploading (it runs outside Steam's process tree). Steam keeps a game
+# "running" ("Exiting…" on screen) until every process it started has exited,
+# and never signals the top one (tested 2026-10-01: 30 s, no kill). So Heroic's
+# shortcut launches through steam-wrap.sh, which stays until the hooks are done.
+# A plain sh script, not savesync itself: Heroic must start even when savesync
+# is missing, broken or an older version (2026-10-01: an update to a version
+# without the wrapper command would have stopped Heroic from launching).
+_hook_lock = None
+
+
+def hold_hook_lock():
+    global _hook_lock
+    HOOK_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    _hook_lock = open(HOOK_LOCK, "a")
+    fcntl.flock(_hook_lock, fcntl.LOCK_SH)      # released when this process exits
+
+
+def wait_for_hooks(timeout):
+    HOOK_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(HOOK_LOCK, "a") as f:
+        time.sleep(1)       # Heroic starts the after-hook as the game exits; let it take the lock
+        start = time.time()
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() - start > timeout:
+                    log(f"steam-wrap: gave up waiting for save-sync after {timeout} s")
+                    return
+                time.sleep(0.5)
+        if time.time() - start > 0.5:
+            log(f"steam-wrap: held Steam's 'Exiting…' for {time.time() - start:.0f} s until save-sync finished")
+
+
+def steam_wrapper_script():
+    return f"""#!/bin/sh
+# Generated by save-sync (savesync setup-steam). Steam launches Heroic through
+# this and counts the game as running until it exits, so after Heroic closes it
+# waits for save-sync's hooks: Steam shows "Exiting..." until saves are uploaded.
+# Heroic starts no matter what state savesync is in.
+"$@" &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null' TERM INT HUP
+rc=0
+while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
+"{HOME}/.local/bin/savesync" heroic-exited >/dev/null 2>&1
+exit "$rc"
+"""
+
+
+def cmd_heroic_exited(_args=None):
+    """Run by steam-wrap.sh once Heroic is gone; Steam shows "Exiting…" until this returns."""
+    wait_for_hooks(timeout=600)
+    finish_open_sessions("Heroic closed while the game ran")
+
+
+def cmd_steam_wrap(args):
+    """Earlier launch-option form (savesync steam-wrap %command%); setup-steam
+    replaces it with steam-wrap.sh. Kept so such a shortcut still launches."""
+    rc = subprocess.call(args) if args else 2
+    cmd_heroic_exited()
+    sys.exit(rc)
+
+
+def vdf_load(b, i=0):
+    """Steam's binary KeyValues (shortcuts.vdf) -> (dict, end). Strings keep their
+    exact bytes (surrogateescape) so a load + dump round-trips byte for byte."""
+    d = {}
+    while True:
+        t = b[i]
+        i += 1
+        if t == 8:
+            return d, i
+        e = b.index(0, i)
+        k = b[i:e].decode("utf-8", "surrogateescape")
+        i = e + 1
+        if t == 0:
+            d[k], i = vdf_load(b, i)
+        elif t == 1:
+            e = b.index(0, i)
+            d[k] = b[i:e].decode("utf-8", "surrogateescape")
+            i = e + 1
+        elif t == 2:
+            d[k] = struct.unpack("<I", b[i:i + 4])[0]
+            i += 4
+        else:
+            raise ValueError(f"unsupported vdf type {t}")
+
+
+def vdf_dump(d):
+    out = b""
+    for k, v in d.items():
+        kb = k.encode("utf-8", "surrogateescape") + b"\0"
+        if isinstance(v, dict):
+            out += b"\0" + kb + vdf_dump(v)
+        elif isinstance(v, int):
+            out += b"\2" + kb + struct.pack("<I", v)
+        else:
+            out += b"\1" + kb + v.encode("utf-8", "surrogateescape") + b"\0"
+    return out + b"\x08"
+
+
+def steam_js(expr, timeout=5):
+    """Evaluate JS in the Steam client (CEF remote debugging on 127.0.0.1:8080; on
+    when Decky Loader is installed or ~/.steam/steam/.cef-enable-remote-debugging
+    exists). Returns the value, or raises OSError when Steam isn't reachable."""
+    pages = json.load(urllib.request.urlopen("http://127.0.0.1:8080/json", timeout=timeout))
+    path = next(p["webSocketDebuggerUrl"] for p in pages if p.get("title") == "SharedJSContext").split("8080", 1)[1]
+    with socket.create_connection(("127.0.0.1", 8080), timeout=timeout) as sk:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sk.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUpgrade: websocket\r\n"
+                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += sk.recv(4096) or b"\r\n\r\n"
+        buf = buf.split(b"\r\n\r\n", 1)[1]
+
+        def read(n):
+            nonlocal buf
+            while len(buf) < n:
+                chunk = sk.recv(65536)
+                if not chunk:
+                    raise OSError("Steam closed the connection")
+                buf += chunk
+            out, buf = buf[:n], buf[n:]
+            return out
+        data = json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": expr, "awaitPromise": True, "returnByValue": True}}).encode()
+        mask = os.urandom(4)
+        n = len(data)
+        head = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0xFE]) + struct.pack(">H", n))
+        sk.sendall(head + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(data)))
+        while True:
+            _, b1 = read(2)
+            n = b1 & 0x7F
+            n = struct.unpack(">H", read(2))[0] if n == 126 else struct.unpack(">Q", read(8))[0] if n == 127 else n
+            msg = json.loads(read(n))
+            if msg.get("id") == 1:
+                res = msg.get("result", {})
+                if "exceptionDetails" in res:
+                    raise RuntimeError(res["exceptionDetails"].get("text", "JS error"))
+                return res.get("result", {}).get("value")
+
+
+def heroic_shortcuts():
+    """[(vdf path, parsed file, shortcut dict)] for Steam shortcuts that start Heroic."""
+    out = []
+    for f in sorted(STEAM_USERDATA.glob("*/config/shortcuts.vdf")):
+        try:
+            raw = f.read_bytes()
+            d, _ = vdf_load(raw)
+            if vdf_dump(d) != raw:                 # never rewrite a file we don't fully understand
+                log(f"setup-steam: {f} doesn't round-trip, skipped")
+                continue
+        except (OSError, ValueError, IndexError) as e:
+            log(f"setup-steam: can't read {f} ({e})")
+            continue
+        for sc in d.get("shortcuts", {}).values():
+            if HEROIC_APP in sc.get("Exe", "") + " " + sc.get("LaunchOptions", ""):
+                out.append((f, d, sc))
+    return out
+
+
+def sc_name(sc):
+    return sc.get("AppName") or sc.get("appname") or str(sc.get("appid"))
+
+
+def wrapped_options(opts, remove=False):
+    plain = opts
+    for w in [STEAM_WRAP, *STEAM_WRAP_OLD]:
+        plain = plain.replace(w, "")
+    plain = plain.strip()
+    return plain if remove else f"{STEAM_WRAP} {plain}"
+
+
+def cmd_setup_steam(args=None, quiet=False):
+    """Prefix Heroic's Steam shortcuts with `steam-wrap.sh %command%`.
+    Live through the Steam client when it's reachable (no restart), and in
+    shortcuts.vdf so it survives a Steam restart either way."""
+    remove = "--remove" in (args or [])
+    out = (lambda m: log(m)) if quiet else say
+    if not remove:
+        APP_HOME.mkdir(parents=True, exist_ok=True)
+        if not STEAM_WRAPPER.exists() or STEAM_WRAPPER.read_text() != steam_wrapper_script():
+            STEAM_WRAPPER.write_text(steam_wrapper_script())
+            STEAM_WRAPPER.chmod(0o755)
+    found = heroic_shortcuts()
+    if not found:
+        if not quiet:
+            say("No Heroic shortcut in Steam (only needed for Game Mode).")
+        return True
+    changed = {}
+    for f, d, sc in found:
+        want = wrapped_options(sc.get("LaunchOptions", ""), remove)
+        if want == sc.get("LaunchOptions", ""):
+            continue
+        sc["LaunchOptions"] = want
+        changed[f] = d
+        try:
+            steam_js(f"SteamClient.Apps.SetShortcutLaunchOptions({int(sc['appid'])}, {json.dumps(want)})")
+            out(f"setup-steam: {sc_name(sc)}: {'unwrapped' if remove else 'wrapped'} (live)")
+        except Exception as e:
+            out(f"setup-steam: {sc_name(sc)}: Steam not reachable ({e.__class__.__name__}); "
+                f"takes effect after Steam restarts")
+    for f, d in changed.items():
+        tmp = f.with_suffix(".vdf.savesync")
+        tmp.write_bytes(vdf_dump(d))
+        shutil.copy2(f, f.with_suffix(".vdf.savesync-backup"))
+        tmp.replace(f)
+    if not changed and not quiet:
+        say("Heroic's Steam shortcut already " + ("unwrapped." if remove else "waits for save-sync."))
+    return True
+
+
+def steam_wrap_active():
+    """Was this Game Mode launch started through steam-wrap? (walk up from the reaper)"""
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv = (p / "cmdline").read_bytes().split(b"\0")
+            if not argv[0].endswith(b"/reaper") or not any(HEROIC_APP.encode() in a for a in argv):
+                continue
+            pid = p.name
+            for _ in range(10):
+                pid = (Path("/proc") / pid / "stat").read_text().rsplit(")", 1)[1].split()[1]
+                if str(STEAM_WRAPPER).encode() in (Path("/proc") / pid / "cmdline").read_bytes():
+                    return True
+                if pid in ("0", "1"):
+                    break
+            return False
+        except OSError:
+            continue
+    return None                                   # not in Game Mode
+
+
 # ------------------------------------------------------------ hook (Heroic)
 def cmd_hook(args):
     if len(args) < 6:
@@ -1159,6 +1435,7 @@ def cmd_hook(args):
     # Finish regardless (the signal goes to this process only, not rclone/ludusavi).
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, signal.SIG_IGN)
+    hold_hook_lock()
     try:
         if stage == "before" and update_before_launch():
             # run this launch with the version just installed
@@ -1205,6 +1482,8 @@ def hook_before(app, title, exe, runner, prefix):
     sync_before(g)
     if g.get("save_paths"):
         start_session(g)
+    if steam_wrap_active() is False:              # Game Mode, shortcut not wrapped: fix it for next time
+        cmd_setup_steam(quiet=True)
     # Remember the state so the after-hook can tell which folders the game
     # wrote to (until the save folders are confirmed).
     if not g.get("confirmed") and not g.get("engine"):
@@ -1220,6 +1499,7 @@ def hook_after(app, title, exe, runner, prefix):
     if g is None:
         log(f"after {app}: not registered, skipped")
         return
+    end_session(g["title"])
     snap_file = STATE / f"{app}.snap.json"
     if not g.get("confirmed") and snap_file.exists():
         snap = load_json(snap_file, {})
@@ -1474,6 +1754,9 @@ def cmd_doctor(_args=None):
               f"{g['title']}: {len(paths)} save folder(s)", f"savesync paths '{app}' --set <folder>")
         if not g.get("confirmed"):
             print(f"  [ ] {g['title']}: save folders not confirmed yet (savesync paths '{app}' --confirm)")
+    for _f, _d, sc in heroic_shortcuts():
+        check(STEAM_WRAP in sc.get("LaunchOptions", ""),
+              f"Steam shortcut '{sc_name(sc)}' waits for save-sync on exit", "savesync setup-steam")
     for f in sorted(STATE.glob("*.pending")) if STATE.exists() else []:
         if f.read_text() == "conflict":
             check(False, f"{f.stem}: unresolved save conflict", f"savesync resolve '{f.stem}' cloud|local")
@@ -1487,6 +1770,8 @@ COMMANDS = {
     "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
     "login": cmd_login, "devices": cmd_devices, "status": cmd_status, "update": cmd_update,
     "resolve": cmd_resolve, "history": cmd_history,
+    "setup-steam": cmd_setup_steam, "heroic-exited": cmd_heroic_exited, "wait-hooks": cmd_heroic_exited,
+    "steam-wrap": cmd_steam_wrap,
 }
 
 if __name__ == "__main__":

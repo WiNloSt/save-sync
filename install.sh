@@ -126,7 +126,13 @@ PY
 steam_hint() {
   local vdf
   for vdf in "$HOME"/.local/share/Steam/userdata/*/config/shortcuts.vdf; do
-    [ -f "$vdf" ] && grep -qa "$HEROIC_APP" "$vdf" && { ok "Heroic is already in Steam (Gaming Mode)"; return; }
+    if [ -f "$vdf" ] && grep -qa "$HEROIC_APP" "$vdf"; then
+      ok "Heroic is already in Steam (Gaming Mode)"
+      # its shortcut launches through `savesync steam-wrap`, so closing Heroic
+      # shows "Exiting…" until save-sync has finished uploading
+      "$SAVESYNC" setup-steam && ok "Steam waits for save-sync when Heroic exits" || true
+      return
+    fi
   done
   step "One manual step for Gaming Mode"
   log "Steam → Add a Game → Add a Non-Steam Game → tick 'Heroic Games Launcher'."
@@ -136,6 +142,7 @@ steam_hint() {
 uninstall() {
   step "Uninstall"
   [ -x "$SAVESYNC" ] && "$SAVESYNC" unhook-heroic || true
+  [ -x "$SAVESYNC" ] && "$SAVESYNC" setup-steam --remove || true
   systemctl --user disable --now save-sync-flush.timer >/dev/null 2>&1 || true
   rm -f "$HOME"/.config/systemd/user/save-sync-flush.* "$HOME/.config/save-sync/session"
   rm -f "$SAVESYNC"
