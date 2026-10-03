@@ -22,7 +22,28 @@ That one line sets up everything, and running it again only repairs what's missi
   and re-run.
 
 Then add games with Heroic's own **Add Game** button and play them from Heroic. Each game's
-save folder is found on its first launch.
+save folder is found on its first launch:
+- **Ren'Py games** need nothing more: their save folder is known, and syncing starts at once.
+- **Other games**: after the first play, a popup shows each folder the game wrote to.
+  Choose **Sync this folder**, **Not this one** or **Ask next time**. Nothing is synced until
+  you pick one, and an unanswered popup asks again at the next launch.
+
+### The save-sync entry in Heroic
+The installer adds **save-sync** to Heroic's library. Launch it like a game (Desktop or Game
+Mode, controller works) for everything that isn't tied to playing:
+- each game's status: synced, waiting to upload, conflict, or no save folder yet
+- **Save folders…**: stop syncing one, decide on suggestions, add one, or watch the next play
+- **Go back to an older save…**: restore one of this device's backups; it syncs to your other
+  devices, and the saves it replaces are kept in `~/.local/share/save-sync/conflicts/`
+- **History**: which device saved, uploaded or downloaded when
+- **Sign in** when this device isn't (Desktop Mode: it opens the browser)
+
+Popups that would lose something (stop syncing, forget folders, go back) put the safe choice
+on the left, focused; the destructive one is red on the right. Escape, closing the window and
+the controller's B are always the safe choice.
+
+If you remove the entry from Heroic, it stays removed; `savesync setup-heroic --menu` (with
+Heroic closed) adds it back.
 
 It installs the latest `main` branch into your home folder, so SteamOS updates don't touch it.
 It **updates itself**: at every game launch (before the game starts, so a fix applies right
@@ -31,6 +52,8 @@ Turn that off with `"auto_update": false` in `~/.config/save-sync/settings.json`
 Re-running the same line also updates or repairs it.
 
 ## Everyday commands
+Everything below is optional: the popups and the save-sync entry in Heroic cover day-to-day
+use. The commands are for checking and fixing things from a terminal.
 
 ```sh
 savesync doctor
@@ -64,6 +87,12 @@ savesync devices
 Signed-in devices; `savesync devices --revoke <id>` signs one out.
 
 ```sh
+savesync restore "<game>" [<backup>]
+```
+List this device's backups of a game, or go back to one (same as the menu's
+**Go back to an older save…**).
+
+```sh
 savesync history "<game>"
 ```
 The cloud's log for a game: which device pushed, pulled or hit a conflict, when, and from which
@@ -91,8 +120,7 @@ Remove save-sync (quit Heroic first, so its launch hooks can be removed). Your b
 | Sync: pull on launch, push on exit, 3-way conflict check, offline queue + retry timer | done |
 | Cloudflare Worker (Google sign-in → session → keys), R2 + rclone crypt | done, deployed |
 | Tested | 2 simulated devices, 10/10 scenarios, on the real Worker + R2 |
-| Not yet tested | a real Heroic launch, the conflict dialog on screen, Gaming Mode, a second physical device |
-| GUI: "where does it save?" dialog, Save Sync window + Heroic tile | next |
+| Popups: "where does it save?", sign-in, errors; save-sync menu entry in Heroic | done (desktop); Game Mode not yet tested |
 
 Design: [docs/PLAN.md](docs/PLAN.md) · findings: [docs/NOTES.md](docs/NOTES.md) · tests: `tests/two-device-sim.sh`
 
@@ -107,7 +135,7 @@ Heroic launches any game
   │     new game? register it; Ren'Py rule or snapshot files to watch the first play
   ├─ the game runs (Heroic's sandbox; ~/games and ~/.renpy are granted)
   └─ After-launch script (global)  ─► flatpak-spawn --host savesync hook after …
-        first play: add folders the game wrote to; ludusavi backup (zip, 10 versions); push
+        first play: ask about the folders the game wrote to; ludusavi backup (zip); push
 
 before: base / local / cloud fingerprints → nothing | pull | push | conflict prompt
 cloud:  R2 bucket, rclone crypt (names + contents encrypted); keys fetched per sync from
@@ -116,16 +144,18 @@ cloud:  R2 bucket, rclone crypt (names + contents encrypted); keys fetched per s
 - **Adding a game:** use Heroic's own **Add Game** button, then launch it once. save-sync
   registers it on that first launch. Games can live anywhere Heroic can see; `~/games` is granted.
 - **Save folders:** found automatically (Ren'Py rule; otherwise by watching what the first
-  play session writes). They start as *not confirmed*.
-  - `savesync list`: what it picked
+  play session writes, then asking in a popup). Change them in the save-sync entry in Heroic,
+  or from a terminal:
+  - `savesync list`: what it picked, and suggestions still waiting for an answer
   - `savesync paths <game> --set <folder>…`: repick (confirms)
   - `savesync paths <game> --add <folder>`: add one
   - `savesync paths <game> --confirm`: accept what it found
-  - `savesync paths <game> --detect`: forget it and watch the next play again
+  - `savesync paths <game> --detect`: forget it (and any "Not this one") and watch the next play again
 - **Gaming Mode:** add Heroic to Steam once (Add a Non-Steam Game), then launch games inside Heroic.
 - **Only Heroic sideloaded games for now.** GOG/Epic launches are logged and skipped.
-- **Backups:** `~/.local/share/save-sync/backups/<game>/`. Restore with
-  `~/.local/share/save-sync/bin/ludusavi --config ~/.config/save-sync/ludusavi restore "<Title>"`.
+- **Backups:** `~/.local/share/save-sync/backups/<game>/`. Go back to one from the save-sync
+  entry in Heroic, or with `savesync restore "<game>" <backup>`; it follows a game that moved
+  to a new version folder, and the replaced saves are kept in `conflicts/`.
 
 ## Files
 | Path | Purpose |
@@ -135,4 +165,6 @@ cloud:  R2 bucket, rclone crypt (names + contents encrypted); keys fetched per s
 | `~/.config/save-sync/games.json` | registry, keyed by Heroic app name: save folders, confirmed flag |
 | `~/.config/save-sync/ludusavi/config.yaml` | generated. Don't edit: rewritten from the registry |
 | `~/Games/Heroic/save-sync/hook.sh` | the global Before/After script Heroic runs |
+| `~/Games/Heroic/save-sync/menu/` | the save-sync library entry: `menu.sh` (runs `savesync menu`) and its cover |
+| `~/.local/share/save-sync/confirm.qml` | the popup for destructive confirmations (written by savesync) |
 | `~/.local/share/save-sync/logs/savesync.log` | log of every hook run |

@@ -165,5 +165,25 @@ play B G-1.1 ""
 on A "$REPO/bin/savesync" heroic-exited
 [ "$(grep -c "after-hook never ran" "$X/dev-A/.local/share/save-sync/logs/savesync.log")" = 1 ] && ok "finished once, not again" || bad "finished twice"
 
+echo "14. A goes back to an older save (savesync restore) → B gets it, A keeps what it replaced"
+play A G-1.0 r1
+play A G-1.0 r2
+older=$(on A "$REPO/bin/savesync" restore "Sim Game" | sed -n 2p | awk '{print $1}')
+on A "$REPO/bin/savesync" restore "Sim Game" "$older"
+[ "$(slot A G-1.0)" = r1 ] && ok "A is back to r1" || bad "A has $(slot A G-1.0)"
+q=$(found r2 "$X/dev-A/.local/share/save-sync/conflicts")
+[ -n "$q" ] && ok "the replaced r2 kept in conflicts/" || bad "r2 lost"
+play B G-1.1 ""
+[ "$(slot B G-1.1)" = r1 ] && ok "B pulled the restored r1" || bad "B has $(slot B G-1.1)"
+
+echo "15. A updates the game to G-1.2, then goes back to a backup made in G-1.0 → lands in G-1.2"
+mkdir -p "$X/dev-A/games/G-1.2/saves"
+play A G-1.2 m1
+older=$(on A "$REPO/bin/savesync" restore "Sim Game" | sed -n 2p | awk '{print $1}')
+echo stale > "$X/dev-A/games/G-1.0/saves/slot1.sav"
+on A "$REPO/bin/savesync" restore "Sim Game" "$older"
+[ "$(slot A G-1.2)" = r1 ] && ok "restored into G-1.2" || bad "G-1.2 has $(slot A G-1.2)"
+[ "$(slot A G-1.0)" = stale ] && ok "old folder untouched" || bad "G-1.0 has $(slot A G-1.0)"
+
 echo; echo "passed $pass, failed $fail   (sandbox: $X)"
 [ "$fail" = 0 ]

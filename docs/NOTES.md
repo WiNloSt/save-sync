@@ -152,6 +152,42 @@
 - Heroic writes `config.json` (where the hooks go) about 3 s after its first start, without
   any clicks. The installer starts it once on a fresh device, then closes it.
 
+## Popups and the save-sync entry in Heroic (2026-10-03, desktop)
+- Heroic has no plugin API; its only extension point is the launch hooks. What isn't tied to a
+  launch lives in a sideloaded library entry (`app_name` `savesync-menu`) whose executable is
+  `~/Games/Heroic/save-sync/menu/menu.sh`. The hooks return at once for that app name. Its
+  folder is its own (`menu/`), never the hook's: Heroic can delete a sideloaded app's folder on
+  uninstall.
+- Heroic launches a native sideloaded app with the sandbox's cwd, `/app/bin`. `flatpak-spawn
+  --host` then fails with "Portal call failed: Failed to change to directory /app/bin" before
+  anything runs; `menu.sh` does `cd "$HOME"` first. (The hooks never hit this.) The
+  `EROFS ... chmod '/app/bin/gamemoderun'` error after every sideloaded launch is harmless:
+  real games log it too.
+- Heroic holds `sideload_apps/library.json` in memory and writes it back, so the entry is added
+  only while Heroic is closed (`setup-heroic`, or the 15-minute timer). Once added,
+  `settings.json` remembers it, so an entry the user removed is never re-added.
+- A process started from a hook with `start_new_session=True` outlives `flatpak-spawn --host`
+  (checked from inside Heroic's sandbox). The sign-in popup relies on it: the browser sign-in
+  finishes in the background while the game starts.
+- kdialog (25.04): a button's icon comes from its role, not its label: Yes `dialog-ok` (✓),
+  No `process-stop` (red), Cancel `dialog-cancel`, Continue `arrow-right`. The left button is
+  always Yes. Escape and the window's close button pick No when there's no Cancel (KMessageBox:
+  anything but Yes is the secondary action). There's no option for icons or colours, and Qt's
+  `-stylesheet` is rejected as an unknown option. So a two-button kdialog can't have the
+  destructive action on the right *and* a safe Escape.
+- Destructive confirmations therefore use a small QML popup (`confirm.qml`, run with `qml6`,
+  Breeze via `QT_QUICK_CONTROLS_STYLE=org.kde.desktop`): safe button left and focused, red
+  destructive button right, Escape / close / B = safe, exit code 10 = do it.
+  `tests/confirm-popup-test.sh` drives it off-screen. **`/usr/bin/qml` is Qt 5's runtime**
+  (qt5-declarative); Qt 6's is `qml6`. Without it, kdialog is used with the destructive action
+  first and the two icons swapped through an icon-theme overlay in `XDG_DATA_DIRS` that only
+  that popup sees (`kiconfinder6` confirms the lookup).
+- Going back to an older backup made before the game moved to a new version folder would
+  restore into the old folder. `restore --preview --api --backup` shows where each file would
+  go; save-sync adds a restore redirect to the current folder, and fails loudly if the live
+  saves didn't change.
+- Not yet seen in Game Mode: the folder popup, the menu (its up/down key mapping), the QML popup.
+
 ## Tested
 - 2026-09-27, through real Heroic, never-seen fake game: the before-hook registered it, the
   first play session detected `…/config/FakeCo/FakeGame` (the `.log` was filtered), and the

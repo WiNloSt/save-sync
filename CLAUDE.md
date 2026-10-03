@@ -23,13 +23,17 @@ design, `docs/NOTES.md` the findings log, and `README.md` the user-facing docs.
   missing, started once for its config), hooks, binaries, sign-in, timer, and Heroic's Steam
   shortcut (asks first, remembers a "no"). `get.sh` is the curl bootstrap that pins a commit.
   `savesync update` reuses it with `NONINTERACTIVE=1`, which never installs apps or adds
-  shortcuts. It only repairs what's there.
+  Steam shortcuts. It only repairs what's there, plus one exception: the save-sync entry in
+  Heroic's library is added once (setup-heroic or the timer, Heroic closed) and never again
+  after the user removes it.
 - `worker/`: the Cloudflare Worker (auth + key release). Deployed separately (`worker/deploy.sh`).
 - `systemd/`: a 15-minute timer that uploads pending saves and checks for updates.
 - `tests/two-device-sim.sh`: two or three simulated devices plus a local-folder "cloud" on one
   machine. Run it after any sync change: `bash tests/two-device-sim.sh <scratch dir>`.
-  `tests/detection-test.sh` covers first-play save-folder detection, and
-  `tests/steam-shortcut-test.sh` covers adding and wrapping the Steam shortcut offline.
+  `tests/detection-test.sh` covers first-play save-folder detection and its popup,
+  `tests/steam-shortcut-test.sh` covers adding and wrapping the Steam shortcut offline,
+  `tests/heroic-menu-test.sh` the save-sync entry in Heroic's library, and
+  `tests/confirm-popup-test.sh` the destructive-confirmation popup (off-screen, Qt 6).
 
 ## Sync model
 - 3-way: `state/<title>.base.json` (the fp both sides agreed on) vs. local fp vs. the cloud
@@ -59,6 +63,14 @@ design, `docs/NOTES.md` the findings log, and `README.md` the user-facing docs.
   port (127.0.0.1:8080, `SteamClient.Apps.SetShortcutLaunchOptions`) and in shortcuts.vdf
   (written only if the file round-trips byte for byte).
 - Killing the game from Steam takes Heroic down before it runs its after-script.
+
+## Popups (no CLI needed day to day)
+- Every question goes through `dialog()` (kdialog; Game Mode tagging + controller keys). An
+  unanswered or unshowable popup is always "later", never a guess. Tests answer them with
+  `SAVESYNC_FOLDER_CHOICE` / `SAVESYNC_CONFLICT_CHOICE`; `SAVESYNC_NO_NOTIFY=1` means no popups.
+- Destructive confirmations use `confirm()` (QML): safe left + focused, destructive right in
+  red, Escape / close / B = safe. Don't use a two-button kdialog for them (see NOTES).
+- Menus label kdialog's Cancel **Back** (**Close** on the first screen).
 
 ## Self-update (affects testing)
 - Every game launch checks `main`'s sha (3 s cap), installs anything newer and re-execs the

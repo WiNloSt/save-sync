@@ -12,11 +12,14 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
   savesync sync [--pending] [<game>…]  sync now / push what was saved while offline
   savesync resolve <game> cloud|local  settle a save conflict without the popup
   savesync history <game> [-n N]     who pushed / pulled / hit a conflict, from the cloud log
+  savesync restore <game> [<backup>]  list this device's backups / go back to one (and sync it)
+  savesync menu                      the popup menu that Heroic's "save-sync" entry opens
   savesync login [--force]           sign this device in (Google, once; skipped if already valid)
   savesync status                    is this device signed in?
   savesync update                    install the latest version now (also checked at every launch)
   savesync devices [--revoke <id>]   signed-in devices; sign one out
-  savesync setup-heroic              set Heroic's global hooks (Heroic must be closed)
+  savesync setup-heroic [--menu]     set Heroic's global hooks + its "save-sync" library entry
+                                     (Heroic must be closed; --menu: re-add an entry you removed)
   savesync setup-steam [--add|--remove]  make Steam wait for save-sync when Heroic exits
                                      (--add: also add Heroic to Steam if it isn't there)
   savesync heroic-exited             finish syncing after Heroic closes (Steam wrapper runs it)
@@ -27,6 +30,7 @@ on exit via Ludusavi. Cloud sync comes later (docs/PLAN.md).
 <game> is the Heroic app name (see `savesync list`) or the title.
 """
 import base64
+import calendar
 import fcntl
 import glob
 import hashlib
@@ -288,6 +292,74 @@ def changed_dirs(before, after, started, roots, game_dir=None):
     return out[:5]
 
 
+def tilde(p):
+    p = str(p)
+    return "~" + p[len(str(HOME)):] if p == str(HOME) or p.startswith(str(HOME) + "/") else p
+
+
+def folder_summary(d):
+    files = sorted((f for f in Path(d).rglob("*") if f.is_file()), key=lambda f: -f.stat().st_mtime)
+    if not files:
+        return "empty"
+    names = ", ".join(f.name for f in files[:3]) + (", …" if len(files) > 3 else "")
+    when = time.strftime("%a %d %b, %H:%M", time.localtime(files[0].stat().st_mtime))
+    return f"{len(files)} file{'s' * (len(files) != 1)} ({names}), last changed {when}"
+
+
+def ask_save_folders(app, reg, gs=None, only=None):
+    """Ask about each suggested save folder (or `only` that one): sync it / not
+    this one / ask next time. Nothing is backed up until the user says yes; a
+    popup that can't be shown or isn't answered means "ask next time", never a
+    guess. Returns True if a folder was added."""
+    g = reg[app]
+    sug = [d for d in g.get("suggested_paths", []) if Path(d).is_dir()]
+    rest = [d for d in sug if only and d != only]
+    sug = [d for d in sug if d not in rest]
+    if not sug:
+        if not rest:
+            g.pop("suggested_paths", None)
+        return False
+    forced = os.environ.get("SAVESYNC_FOLDER_CHOICE")         # yes | no | later (tests)
+    if not forced and os.environ.get("SAVESYNC_NO_NOTIFY") == "1":
+        forced = "later"                                          # headless: never a popup
+    gs = None if forced else (gs or gamescope_target())
+    added, later = False, []
+    for i, d in enumerate(sug):
+        if forced:
+            choice = forced
+        else:
+            text = (f"Where does {g['title']} keep its saves?\n\n"
+                    f"While you played, it wrote to\n  {tilde(d)}\n  {folder_summary(d)}\n\n"
+                    f"Sync this folder between your devices?"
+                    + (f"\n\n(suggestion {i + 1} of {len(sug)})" if len(sug) > 1 else "")
+                    + (PAD_HINT.format("Ask next time") if gs else ""))
+            rc = run_dialog(["--title", f"save-sync: {g['title']}", "--yesnocancel", text,
+                             "--yes-label", "Sync this folder", "--no-label", "Not this one",
+                             "--cancel-label", "Ask next time"], timeout=300, gs=gs)
+            choice = {0: "yes", 1: "no", 2: "later"}.get(rc)
+            if choice is None:                     # no display, or nobody answered
+                log(f"save folders {app}: popup {'timed out' if rc == 'timeout' else 'unavailable'}; "
+                    f"asking next time")
+                later += sug[i:]
+                break
+        log(f"save folders {app}: {d} -> {choice}")
+        if choice == "yes":
+            if d not in g.setdefault("save_paths", []):
+                g["save_paths"].append(d)
+            g["confirmed"] = added = True
+        elif choice == "no":
+            g.setdefault("rejected_paths", []).append(d)
+        else:
+            later.append(d)
+    g["suggested_paths"] = later + rest
+    if not g["suggested_paths"]:
+        g.pop("suggested_paths")
+    save_json(REGISTRY, reg)
+    if added:
+        cmd_gen_config(quiet=True)
+    return added
+
+
 # ------------------------------------------------------------ Ludusavi config
 def custom_games(reg):
     out = []
@@ -428,12 +500,12 @@ def obscure(secret):
 def worker_cloud_env(c):
     """Fetch the R2 key + crypt key for this sync. Held in memory only."""
     if not SESSION.exists():
-        notify("save-sync: not signed in", "Run: savesync login (in Desktop Mode)")
+        ask_sign_in("This device isn't signed in")
         raise Offline("not signed in")
     try:
         k = worker_call(c["url"].rstrip("/") + "/keys", "POST", {}, SESSION.read_text().strip())
     except SignedOut:
-        notify("save-sync: signed out", "Sign in again in Desktop Mode: savesync login")
+        ask_sign_in("This device was signed out (the sign-in expired or was revoked)")
         raise Offline("signed out")
     r2, cr = k["r2"], k["crypt"]
     return {
@@ -449,13 +521,58 @@ def worker_cloud_env(c):
     }
 
 
-def session_status():
+INTERACTIVE = False      # a hook or the menu: someone is at the screen (not the timer)
+ASK_SIGN_IN_EVERY = 6 * 3600
+
+
+def desktop_mode():
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def ask_sign_in(why, gs=None, force=False):
+    """Signed out: offer to sign in. Desktop Mode opens the browser (the sign-in
+    finishes in the background; the game isn't held). Game Mode has no browser
+    save-sync can show, so it says where to do it. At most every few hours."""
+    if not INTERACTIVE and not force:
+        notify("save-sync: not signed in", "Open save-sync in Heroic (Desktop Mode) and choose Sign in.")
+        return
+    stamp = STATE / "sign-in-asked"
+    if not force and stamp.exists() and time.time() - stamp.stat().st_mtime < ASK_SIGN_IN_EVERY:
+        log(f"sign-in: {why}; asked recently, not again yet")
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    gs = gs or gamescope_target()
+    lead = f"{why}, so saves are only backed up here, not synced."
+    if gs or not desktop_mode():
+        alert("save-sync: sign in from Desktop Mode",
+              f"{lead}\n\nIn Desktop Mode, open save-sync in Heroic and choose Sign in.", gs=gs)
+        return
+    if os.environ.get("SAVESYNC_NO_NOTIFY") == "1":
+        return
+    rc = run_dialog(["--title", "save-sync", "--yesno", f"{lead}\n\nSign in with Google now? "
+                     "Your browser opens; the game doesn't wait for it.",
+                     "--yes-label", "Sign in", "--no-label", "Not now"], timeout=300)
+    if rc == 0:
+        start_sign_in()
+
+
+def start_sign_in():
+    """Run the Google sign-in in its own process, so a game launch or the menu
+    isn't held while the browser is open. It says when it's done."""
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "login", "--background"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    log("sign-in: started in the background")
+
+
+def session_status(timeout=15):
     """'valid' | 'invalid' | 'missing' | 'unknown' (Worker unreachable)."""
     c = settings().get("cloud") or {}
     if not SESSION.exists() or not SESSION.read_text().strip():
         return "missing"
     try:
-        worker_call(c["url"].rstrip("/") + "/devices", token=SESSION.read_text().strip())
+        worker_call(c["url"].rstrip("/") + "/devices", token=SESSION.read_text().strip(), timeout=timeout)
         return "valid"
     except SignedOut:
         return "invalid"
@@ -472,6 +589,25 @@ def cmd_status(_args=None):
 
 
 def cmd_login(args=None):
+    """`--background` (from a popup): only one at a time, and the result is a
+    notification, since nobody watches a terminal."""
+    if "--background" in (args or []):
+        STATE.mkdir(parents=True, exist_ok=True)
+        lock = open(STATE / "login.lock", "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("sign-in: already waiting for one")
+            return
+        try:
+            if cmd_login([a for a in args if a != "--background"]):
+                notify("save-sync: signed in", f"{DEVICE} syncs saves on every game launch and exit.")
+            else:
+                notify("save-sync: can't sign in right now", "The sign-in service can't be reached. Try again online.")
+        except SystemExit as e:
+            log(f"sign-in: {e}")
+            notify("save-sync: not signed in", str(e))
+        return
     c = settings().get("cloud") or {}
     if c.get("mode") != "worker":
         raise SystemExit("cloud isn't configured on this device (settings.json has no worker url)")
@@ -479,10 +615,10 @@ def cmd_login(args=None):
         st = session_status()
         if st == "valid":
             say(f"Already signed in ({DEVICE}). Use --force to sign in again.")
-            return
+            return True
         if st == "unknown":
             say("Can't reach the Worker to check the existing sign-in; keeping it. Try again when online.")
-            return
+            return False
         if st == "invalid":
             SESSION.unlink(missing_ok=True)
             say("The saved sign-in expired or was revoked; signing in again.")
@@ -510,7 +646,7 @@ def cmd_login(args=None):
             with os.fdopen(fd, "w") as f:
                 f.write(r["token"])
             say(f"Signed in. {DEVICE} will sync on every game launch and exit.")
-            return
+            return True
         if state in ("denied", "expired"):
             raise SystemExit(f"Sign-in {state}.")
     raise SystemExit("Timed out waiting for sign-in (10 min).")
@@ -796,11 +932,12 @@ def tag_for_gamescope(proc, display, appid):
         log(f"dialog: can't tag the window for Game Mode ({e})")
 
 
-def gamepad_to_keys(proc, display):
+def gamepad_to_keys(proc, display, keys="buttons"):
     """kdialog can't read a controller, and in Game Mode there's no keyboard. Steam
     keeps feeding its virtual Xbox pad (/dev/input/js*, readable by the seat user)
-    while our window is focused, so translate it: d-pad / left stick = previous /
-    next button, A = press, B = Escape ('Decide later')."""
+    while our window is focused, so translate it. keys="buttons" (a question):
+    d-pad / left stick = previous / next button, A = press, B = Escape ('Decide
+    later'). keys="list" (a menu): up / down = move, A = Return, B = Escape."""
     import struct, select
     fds = []
     for path in glob.glob("/dev/input/js*"):
@@ -825,7 +962,8 @@ def gamepad_to_keys(proc, display):
                     if kind & 0x80:                 # initial state, not a press
                         continue
                     if kind == 1 and value == 1:   # button down: 0 = A, 1 = B
-                        {0: lambda: key("space"), 1: lambda: key("Escape")}.get(num, lambda: None)()
+                        press = "Return" if keys == "list" else "space"
+                        {0: lambda: key(press), 1: lambda: key("Escape")}.get(num, lambda: None)()
                     elif kind == 2 and num in (0, 1, 6, 7):   # stick x/y, d-pad x/y
                         d = 1 if value > 16000 else -1 if value < -16000 else 0
                         if abs(value) < 8000:
@@ -833,7 +971,11 @@ def gamepad_to_keys(proc, display):
                         elif d and held.get(num) != d:
                             held[num] = d
                             # arrows, not Tab: Shift+Tab is Steam's overlay shortcut
-                            key("Right" if d > 0 else "Left")
+                            if keys == "list":
+                                if num in (1, 7):
+                                    key("Down" if d > 0 else "Up")
+                            else:
+                                key("Right" if d > 0 else "Left")
     except OSError as e:
         log(f"dialog: gamepad input stopped ({e})")
     finally:
@@ -841,33 +983,228 @@ def gamepad_to_keys(proc, display):
             os.close(fd)
 
 
-def run_dialog(args, timeout=600, gs=None):
-    """kdialog's exit code (0/1/2 = the three buttons), "timeout", or None when no
-    dialog could be shown (no display: kdialog aborts, rc < 0). gs: gamescope_target()."""
+DANGER_ICONS = APP_HOME / "danger-icons"
+
+
+def danger_icons():
+    """kdialog gives its first button ✓ (dialog-ok) and its second a red ⊖
+    (process-stop), whatever they say. A destructive confirmation keeps the
+    destructive action first (so B / Escape, which kdialog counts as the second
+    button, stays safe) and swaps the two icons through an icon-theme overlay
+    that only that popup sees: red on the destructive action, ✓ on the safe one."""
+    theme, group = "breeze", None
+    kdeglobals = HOME / ".config/kdeglobals"
+    for line in kdeglobals.read_text(errors="replace").splitlines() if kdeglobals.exists() else []:
+        if line.startswith("["):
+            group = line.strip()
+        elif group == "[Icons]" and line.startswith("Theme="):
+            theme = line.split("=", 1)[1].strip() or theme
+    for th in dict.fromkeys([theme, "breeze-dark", "breeze"]):
+        base = Path("/usr/share/icons") / th / "actions"
+        pick = lambda name: next((base / d / f"{name}.svg" for d in ("22", "24", "16", "32")
+                                  if (base / d / f"{name}.svg").exists()), None)
+        red, tick = pick("process-stop"), pick("dialog-ok")
+        if not (base.is_dir() and red and tick):
+            continue
+        for size in (d.name for d in base.iterdir() if d.is_dir()):
+            out = DANGER_ICONS / "icons" / th / "actions" / size
+            out.mkdir(parents=True, exist_ok=True)
+            for name, target in (("dialog-ok.svg", red), ("process-stop.svg", tick)):
+                link = out / name
+                if not link.is_symlink() or os.readlink(link) != str(target):
+                    link.unlink(missing_ok=True)
+                    link.symlink_to(target)
+    return str(DANGER_ICONS)
+
+
+def dialog(args, timeout=600, gs=None, keys="buttons", danger=False, program="kdialog", codes=(0, 1, 2)):
+    """(rc, stdout) of kdialog. rc: its exit code (0/1/2 = the buttons), "timeout",
+    or None when no dialog could be shown (no display: kdialog aborts, rc < 0).
+    gs: gamescope_target(). keys: how the controller drives it (gamepad_to_keys).
+    danger: the first button is destructive (red icon), the second safe (✓)."""
     env = dict(os.environ)
+    if danger:
+        try:
+            env["XDG_DATA_DIRS"] = f"{danger_icons()}:{env.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share'}"
+        except OSError as e:
+            log(f"dialog: can't set up the warning icons ({e})")
+    if program != "kdialog":                 # the QML popup: Breeze, like kdialog
+        env.setdefault("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
     if gs:
         env.update(DISPLAY=gs[0], QT_QPA_PLATFORM="xcb")
         env.pop("WAYLAND_DISPLAY", None)
     try:
-        p = subprocess.Popen(["kdialog", *args], env=env, text=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        p = subprocess.Popen([program, *args], env=env, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as e:
-        log(f"dialog: can't run kdialog ({e})")
-        return None
+        log(f"dialog: can't run {program} ({e})")
+        return None, ""
     if gs:
         threading.Thread(target=tag_for_gamescope, args=(p, *gs), daemon=True).start()
-        threading.Thread(target=gamepad_to_keys, args=(p, gs[0]), daemon=True).start()
+        threading.Thread(target=gamepad_to_keys, args=(p, gs[0], keys), daemon=True).start()
     try:
-        _, err = p.communicate(timeout=timeout)
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()
-        return "timeout"
-    if p.returncode not in (0, 1, 2):
-        log(f"dialog: kdialog failed (rc {p.returncode}, {'Game Mode' if gs else 'desktop'}): "
+        return "timeout", ""
+    if p.returncode not in codes:
+        log(f"dialog: {program} failed (rc {p.returncode}, {'Game Mode' if gs else 'desktop'}): "
             f"{(err.strip().splitlines() or ['no output'])[0]}")
-        return None
-    return p.returncode
+        return None, ""
+    return p.returncode, out.strip()
+
+
+CONFIRM_QML = APP_HOME / "confirm.qml"
+# A destructive confirmation, which kdialog can't lay out safely: there the left
+# button is always "Yes" and Escape / the window's close button always pick the
+# right one. Here the safe action is on the left, muted and focused; the
+# destructive one is on the right, in red; Escape, closing the window and the
+# controller's B are always the safe action. Exit code 10 = do it, 1 = don't.
+CONFIRM_QML_SRC = """import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import org.kde.kirigami as Kirigami
+
+ApplicationWindow {
+    id: win
+    // after `--`: title, heading, body, safe label, destructive label
+    property var arg: Qt.application.arguments.slice(Qt.application.arguments.indexOf("--") + 1)
+    property bool exitOnDecide: true             // tests watch `decided` instead
+    property bool done: false
+    signal decided(int code)
+    function finish(code) {
+        if (done) return
+        done = true
+        decided(code)
+        if (exitOnDecide) Qt.exit(code)
+    }
+    title: arg[0] || "save-sync"
+    flags: Qt.Dialog
+    visible: true
+    readonly property int fitWidth: Math.min(640, Math.max(440, content.implicitWidth + 2 * Kirigami.Units.gridUnit))
+    readonly property int fitHeight: content.implicitHeight + 2 * Kirigami.Units.gridUnit
+    width: fitWidth; minimumWidth: fitWidth; maximumWidth: fitWidth
+    height: fitHeight; minimumHeight: fitHeight; maximumHeight: fitHeight
+    onClosing: finish(1)                         // the window's close button: safe
+    Shortcut { sequences: ["Escape", "Back"]; onActivated: win.finish(1) }
+
+    ColumnLayout {
+        id: content
+        anchors.fill: parent
+        anchors.margins: Kirigami.Units.gridUnit
+        spacing: Kirigami.Units.largeSpacing
+        RowLayout {
+            spacing: Kirigami.Units.largeSpacing
+            Kirigami.Icon {
+                source: "dialog-warning"
+                Layout.alignment: Qt.AlignTop
+                implicitWidth: Kirigami.Units.iconSizes.large
+                implicitHeight: Kirigami.Units.iconSizes.large
+            }
+            ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+                Kirigami.Heading {
+                    text: win.arg[1] || ""
+                    level: 3
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Layout.maximumWidth: 520
+                }
+                Label {
+                    text: win.arg[2] || ""
+                    visible: text !== ""
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Layout.maximumWidth: 520
+                }
+            }
+        }
+        RowLayout {
+            Layout.alignment: Qt.AlignRight
+            spacing: Kirigami.Units.smallSpacing
+            Button {
+                id: safe
+                objectName: "safe"
+                text: win.arg[3] || "Cancel"
+                focus: true
+                KeyNavigation.right: danger
+                Keys.onReturnPressed: clicked()
+                Keys.onEnterPressed: clicked()
+                onClicked: win.finish(1)
+            }
+            Button {
+                id: danger
+                objectName: "danger"
+                text: win.arg[4] || "OK"
+                KeyNavigation.left: safe
+                Keys.onReturnPressed: clicked()
+                Keys.onEnterPressed: clicked()
+                onClicked: win.finish(10)
+                contentItem: RowLayout {
+                    spacing: Kirigami.Units.smallSpacing
+                    Kirigami.Icon {
+                        source: "edit-delete"
+                        color: Kirigami.Theme.negativeTextColor
+                        isMask: true
+                        implicitWidth: Kirigami.Units.iconSizes.small
+                        implicitHeight: Kirigami.Units.iconSizes.small
+                    }
+                    Label {
+                        text: danger.text
+                        color: Kirigami.Theme.negativeTextColor
+                        font.bold: true
+                    }
+                }
+            }
+        }
+    }
+    Component.onCompleted: { safe.forceActiveFocus(); raise(); requestActivate() }
+}
+"""
+
+
+def confirm(title, heading, body, safe, danger, gs=None):
+    """A destructive confirmation: True only when the user picks `danger`. Safe
+    on the left (focused), destructive on the right in red; Escape, the close
+    button and B are `safe`. Without the qml runtime: kdialog, destructive first."""
+    if gs:
+        body += f"\n\nController: D-pad to pick, A to confirm, B = {safe}."
+    qml = shutil.which("qml6") or next((q for q in ("/usr/lib/qt6/bin/qml",) if os.access(q, os.X_OK)), None)
+    if qml:                                  # Qt 6's runtime; /usr/bin/qml is Qt 5's
+        APP_HOME.mkdir(parents=True, exist_ok=True)
+        if not CONFIRM_QML.exists() or CONFIRM_QML.read_text() != CONFIRM_QML_SRC:
+            CONFIRM_QML.write_text(CONFIRM_QML_SRC)
+        rc, _ = dialog(["-a", "widget", str(CONFIRM_QML), "--", title, heading, body, safe, danger],
+                       timeout=1800, gs=gs, program=qml, codes=(1, 10))
+        if rc in (1, 10, "timeout"):
+            return rc == 10
+        log("dialog: the qml popup failed; asking with kdialog")
+    rc = run_dialog(["--title", title, "--yesno", f"{heading}\n\n{body}",
+                     "--yes-label", danger, "--no-label", safe], timeout=1800, gs=gs, danger=True)
+    if rc is None:
+        raise NoDialog()
+    return rc == 0
+
+
+def run_dialog(args, timeout=600, gs=None, danger=False):
+    return dialog(args, timeout, gs, danger=danger)[0]
+
+
+PAD_HINT = "\n\nController: D-pad to pick, A to confirm, B = {}."
+
+
+def alert(summary, body, gs=None):
+    """A message that matters (a failed backup, sign-in needed): a popup with an OK
+    button, since notifications may never show in Game Mode. Falls back to a
+    notification when no popup can be shown."""
+    log(f"alert: {summary} | {body}")
+    if os.environ.get("SAVESYNC_NO_NOTIFY") == "1":
+        return
+    gs = gs or gamescope_target()
+    if run_dialog(["--title", "save-sync", "--sorry", f"{summary}\n\n{body}"
+                   + (PAD_HINT.format("close") if gs else "")], timeout=300, gs=gs) is None:
+        notify(summary, body)
 
 
 def ask_conflict(title, head, local_fp, g=None):
@@ -889,14 +1226,15 @@ def ask_conflict(title, head, local_fp, g=None):
             f"{since(get_session(title).get('start'))}\n\n"
             f"Whichever you don't pick is kept in\n~/.local/share/save-sync/conflicts/\n"
             f"'Decide later' plays this device's save, uploads nothing, and asks again next launch."
-            + ("\n\nController: D-pad to pick, A to confirm, B = Decide later." if gs else ""))
+            + (PAD_HINT.format("Decide later") if gs else ""))
     rc = run_dialog(["--title", f"save-sync: {title}", "--warningyesnocancel", text,
                      "--yes-label", "Use cloud save", "--no-label", "Use this device's save",
                      "--cancel-label", "Decide later"], gs=gs)
     if rc in (0, 1, 2):
         return ("cloud", "local", "later")[rc], "user"
     notify(f"{title}: save conflict, not resolved",
-           f"Playing this device's save; nothing uploaded. Resolve: savesync resolve '{title}' cloud|local")
+           "Playing this device's save; nothing uploaded. It asks again at the next launch "
+           "(or open save-sync in Heroic).")
     return "later", "timeout" if rc == "timeout" else "unavailable"
 
 
@@ -1123,6 +1461,11 @@ def cmd_sync(args):
             finish_open_sessions("Heroic closed while the game ran; found by the timer")
         except Offline as e:
             log(f"sync: still offline ({e})")
+        if menu_entry_state() == "missing" and HOOK.exists():
+            try:
+                ensure_menu_entry()
+            except Exception as e:
+                log(f"menu: can't add the Heroic library entry ({e!r})")
     for f in STATE.glob("*.pending") if STATE.exists() else []:
         say(f"  pending: {f.stem} ({f.read_text()})")
 
@@ -1138,6 +1481,25 @@ def cmd_resolve(args):
     say(f"{g['title']}: still pending ({p.read_text()})" if p.exists() else f"{g['title']}: in sync")
 
 
+def cloud_history(title, n=30):
+    """(the newest n events for one game, oldest first; the cloud head)."""
+    env = cloud_env()
+    if env is None:
+        raise SystemExit("cloud sync is not configured")
+    names = sorted(x for x in rclone(env, "lsf", f"ss:events/{title}", check=False).stdout.split("\n")
+                   if x.endswith(".json"))[-n:]
+    tmp = STATE / "history"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    (tmp / "list").write_text("\n".join(names) + "\n")
+    if names:
+        rclone(env, "copy", "--files-from-raw", str(tmp / "list"), f"ss:events/{title}", str(tmp / "ev"))
+    events = [load_json(tmp / "ev" / name, {}) for name in names]
+    head = cloud_head(env, title)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return events, head
+
+
 def cmd_history(args):
     """The cloud's event log for one game: who pushed / pulled / hit a conflict."""
     n = 30
@@ -1151,21 +1513,10 @@ def cmd_history(args):
         title = reg[find_game(reg, args[0])]["title"]
     except SystemExit:
         title = args[0]                  # a game this device doesn't have
-    env = cloud_env()
-    if env is None:
-        raise SystemExit("cloud sync is not configured")
-    names = sorted(x for x in rclone(env, "lsf", f"ss:events/{title}", check=False).stdout.split("\n")
-                   if x.endswith(".json"))[-n:]
-    tmp = STATE / "history"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    (tmp / "list").write_text("\n".join(names) + "\n")
-    if names:
-        rclone(env, "copy", "--files-from-raw", str(tmp / "list"), f"ss:events/{title}", str(tmp / "ev"))
+    events, head = cloud_history(title, n)
     t = lambda x: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(x)) if x else "?"
     f8 = lambda x: (x or "-")[:8]
-    for name in names:
-        e = load_json(tmp / "ev" / name, {})
+    for e in events:
         k = e.get("kind")
         if k == "push":
             what = (f"{f8(e.get('fp'))} on top of {f8(e.get('parent'))}, replacing {f8(e.get('replaced'))}"
@@ -1180,12 +1531,94 @@ def cmd_history(args):
         else:
             what = json.dumps(e)
         say(f"{t(e.get('time'))}  {e.get('device', '?'):<12} {k:<9} {what}  [{e.get('version')}]")
-    if not names:
+    if not events:
         say(f"no events for {title} yet (the log starts with this version)")
-    head = cloud_head(env, title)
     if head:
         say(f"cloud now: {f8(head['fp'])} from {head.get('device')} at {t(head.get('time'))}")
-    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def local_backups(title):
+    """This device's backups of a game, oldest first: [{name, when (epoch)}]."""
+    ensure_config()
+    r = ludusavi("backups", "--api", title)
+    try:
+        found = json.loads(r.stdout).get("games", {}).get(title, {}).get("backups", [])
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for b in found:
+        try:
+            when = calendar.timegm(time.strptime(b.get("when", "")[:19], "%Y-%m-%dT%H:%M:%S"))  # UTC
+        except ValueError:
+            when = 0
+        out.append({"name": b["name"], "when": when})
+    return out
+
+
+def restore_redirects(g, name):
+    """A backup made before the game moved to a new version folder (SpiderMan-1.0-pc
+    -> SpiderMan-1.1-pc) would restore into the old folder; send it to the current
+    one. Read from where the backup would write: (redirects, the preview's change)."""
+    title, gd = g["title"], g.get("game_dir")
+    r = ludusavi("restore", "--preview", "--api", "--backup", name, title)
+    try:
+        info = json.loads(r.stdout)["games"][title]
+    except (json.JSONDecodeError, KeyError):
+        raise RuntimeError(f"can't read backup {name}: {(r.stderr or r.stdout).strip()[-300:]}")
+    paths, moved = g.get("save_paths", []), {}
+    for f in info.get("files", {}):
+        if any(f == p or f.startswith(p + "/") for p in paths):
+            continue
+        for p in paths:
+            if gd and p.startswith(gd + "/"):
+                i = f.find(p[len(gd):] + "/")          # e.g. /game/saves/ under the old folder
+                if i > 0 and f[:i] != gd:
+                    moved[f[:i]] = gd
+    return [{"kind": "restore", "source": a, "target": b} for a, b in moved.items()], info.get("change")
+
+
+def restore_backup(g, name):
+    """Go back to an older backup of this game, on this device and (as a normal
+    upload) in the cloud. The saves it replaces are kept in conflicts/ first."""
+    title = g["title"]
+    ensure_config()
+    redirects, change = restore_redirects(g, name)
+    before = fingerprint(g["save_paths"])
+    dest = quarantine(title, g, f"replaced by restoring the older backup {name}")
+    if redirects:
+        cmd_gen_config(quiet=True, redirects=redirects)
+    r = ludusavi("restore", "--force", "--no-cloud-sync", "--backup", name, title)
+    if redirects:
+        cmd_gen_config(quiet=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"restore failed: {r.stderr.strip()}")
+    if fingerprint(g["save_paths"]) == before and change != "Same":
+        raise RuntimeError(f"restoring {name} didn't change the saves in {g['save_paths']} "
+                           f"(redirects: {redirects})")
+    log(f"restore {title}: restored {name}{f' via {redirects}' if redirects else ''} "
+        f"(the saves it replaced: {dest})")
+    # A new newest backup holding the restored saves: other devices pull the newest.
+    r = backup([title])
+    if r.returncode != 0:
+        raise RuntimeError(f"backup failed: {r.stderr.strip()}")
+    try:
+        sync_after(g, f"restored an older backup ({name})")
+    except Offline as e:
+        log(f"restore {title}: offline ({e}); uploads later")
+    return dest
+
+
+def cmd_restore(args):
+    """List a game's backups on this device, or go back to one of them."""
+    if not args or len(args) > 2:
+        raise SystemExit("usage: savesync restore <game> [<backup>]")
+    reg = registry()
+    g = reg[find_game(reg, args[0])]
+    if len(args) == 1:
+        for b in reversed(local_backups(g["title"])):
+            say(f"  {b['name']}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(b['when']))}")
+        return
+    say(f"Restored {args[1]}. The saves it replaced are in {restore_backup(g, args[1])}")
 
 
 # ------------------------------------------------------------ Steam (Game Mode)
@@ -1502,6 +1935,8 @@ def steam_wrap_active():
 def cmd_hook(args):
     if len(args) < 6:
         raise SystemExit("usage: savesync hook before|after <app> <title> <exec> <runner> <prefix>")
+    global INTERACTIVE
+    INTERACTIVE = True
     stage, app, title, exe, runner, prefix = args[:6]
     # Closing Heroic (Steam's "Exit game" in Game Mode) SIGTERMs the hook script,
     # and flatpak-spawn forwards that to us: the backup/upload died half-way.
@@ -1516,11 +1951,13 @@ def cmd_hook(args):
             os.execve(new, [new, "hook", *args], {**os.environ, "SAVESYNC_UPDATED": "1"})
     except Exception as e:  # an update problem never blocks the game
         log(f"update: at launch: {e!r}")
+    if app == MENU_APP:                  # the save-sync menu itself, not a game
+        return
     try:
         (hook_before if stage == "before" else hook_after)(app, title, exe, runner, prefix)
     except Exception as e:  # never break a game launch
         log(f"hook {stage} {app}: ERROR {e!r}")
-        notify(f"{title}: save-sync error", str(e))
+        alert(f"{title}: save-sync error", f"{e}\nDetails: ~/.local/share/save-sync/logs/savesync.log")
 
 
 def hook_before(app, title, exe, runner, prefix):
@@ -1552,6 +1989,8 @@ def hook_before(app, title, exe, runner, prefix):
             log(f"before {app}: game moved {old_dir} -> {new_dir}, save paths follow")
             cmd_gen_config(quiet=True)
         save_json(REGISTRY, reg)
+    if g.get("suggested_paths"):                   # left as "Ask next time"
+        ask_save_folders(app, reg)
     sync_before(g)
     if g.get("save_paths"):
         start_session(g)
@@ -1581,21 +2020,21 @@ def hook_after(app, title, exe, runner, prefix):
         found = changed_dirs(snap.get("files", {}), after, snap.get("started", time.time()),
                              roots, g.get("game_dir"))
         snap_file.unlink(missing_ok=True)
-        new = [d for d in found if d not in g.get("save_paths", [])]
-        g["suggested_paths"] = new
+        skip = set(g.get("save_paths", [])) | set(g.get("rejected_paths", []))
+        sug = list(dict.fromkeys([*g.get("suggested_paths", []), *found]))
+        g["suggested_paths"] = [d for d in sug if d not in skip]
         save_json(REGISTRY, reg)
-        log(f"after {app}: suggested save folders (NOT backed up until confirmed): {new}")
-        if new:
-            notify(f"{title}: where does it save?",
-                   "Suggested (not backed up yet):\n" + "\n".join(new) +
-                   f"\nPick: savesync paths '{app}' --add <folder>   (or --set)")
-        elif not g.get("save_paths"):
-            notify(f"{title}: no save folder found", f"Set it: savesync paths '{app}' --set <folder>")
+        log(f"after {app}: suggested save folders (NOT backed up until confirmed): {g['suggested_paths']}")
+        ask_save_folders(app, reg)
+        if not g.get("save_paths") and not g.get("suggested_paths"):
+            notify(f"{title}: no save folder found yet",
+                   "save-sync watches the next play again. To pick one yourself, open save-sync in Heroic.")
     if not g.get("save_paths"):
         return
     r = backup([g["title"]])
     if r.returncode != 0:
-        notify(f"{title}: save backup FAILED", "See ~/.local/share/save-sync/logs/savesync.log")
+        alert(f"{title}: save backup FAILED", "Your saves weren't backed up or uploaded.\n"
+              "Details: ~/.local/share/save-sync/logs/savesync.log")
         return
     log(f"after {app}: backup ok")
     sync_after(g)
@@ -1636,6 +2075,7 @@ def cmd_paths(args):
     elif rest[0] == "--detect":
         g["save_paths"] = rule_paths(g)
         g.pop("suggested_paths", None)
+        g.pop("rejected_paths", None)
         g["confirmed"] = False   # watch the next play session again (if no engine rule)
     elif rest[0] == "--confirm":
         sug = g.get("suggested_paths", [])
@@ -1695,7 +2135,7 @@ exec flatpak-spawn --host {savesync} hook "$HEROIC_GAME_SCRIPT_STAGE" \\
 """
 
 
-def cmd_setup_heroic(_args=None):
+def cmd_setup_heroic(args=None):
     HOOK_DIR.mkdir(parents=True, exist_ok=True)
     HOOK.write_text(hook_script())
     HOOK.chmod(0o755)
@@ -1730,6 +2170,7 @@ def cmd_setup_heroic(_args=None):
             save_json(f, data)
             say(f"  patched per-game hook in {f.name}")
     migrate_phase1()
+    say(f"  {ensure_menu_entry(force='--menu' in (args or [])) or 'Heroic is running: save-sync joins its library later'}")
 
 
 def migrate_phase1():
@@ -1787,8 +2228,366 @@ def cmd_unhook_heroic(_args=None):
                     if s.get(key) == str(HOOK):
                         s[key] = ""
         save_json(f, data)
+    remove_menu_entry()
     shutil.rmtree(HOOK_DIR, ignore_errors=True)
-    say("  Heroic hooks removed")
+    say("  Heroic hooks and the save-sync library entry removed")
+
+
+# ------------------------------------------------------------ menu (Heroic library entry)
+# Heroic has no plugin API; its only extension point is the launch hooks. What
+# isn't tied to a launch (save folders, older saves, history, sign-in) lives in
+# a "save-sync" entry in Heroic's library: launching it runs menu.sh, which opens
+# this menu on the host with the same popups (and controller mapping) as the
+# conflict prompt. The hooks skip that entry.
+MENU_APP = "savesync-menu"
+MENU_DIR = HOOK_DIR / "menu"        # its own folder: Heroic may delete it on uninstall, never hook.sh
+MENU_SCRIPT = MENU_DIR / "menu.sh"
+MENU_ART = MENU_DIR / "save-sync.svg"
+MENU_ART_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="600" height="900" viewBox="0 0 600 900">
+  <rect width="600" height="900" fill="#1b2838"/>
+  <path d="M190 470a70 70 0 0 1 14-138 100 100 0 0 1 190 10 64 64 0 0 1 16 128z" fill="#66c0f4"/>
+  <path d="M300 372v84m0 0-30-30m30 30 30-30" stroke="#1b2838" stroke-width="18" fill="none"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="300" y="610" fill="#ffffff" font-family="sans-serif" font-size="64" font-weight="bold"
+        text-anchor="middle">save-sync</text>
+  <text x="300" y="670" fill="#8f98a0" font-family="sans-serif" font-size="30"
+        text-anchor="middle">save folders · older saves · history</text>
+</svg>
+"""
+PAD_LIST = "\n\nController: D-pad to move, A to choose, B = {}."
+
+
+def menu_script():
+    return f"""#!/bin/sh
+# Generated by save-sync. Heroic's "save-sync" library entry runs this: the
+# save-sync menu (save folders, older saves, history, sign-in), on the host.
+# Plain sh, so the entry launches whatever version of savesync is installed.
+# Heroic starts it in /app/bin, which doesn't exist on the host: flatpak-spawn
+# would fail to change into it ("Portal call failed"), so start from $HOME.
+cd "{HOME}" && exec flatpak-spawn --host "{HOME}/.local/bin/savesync" menu
+"""
+
+
+def menu_entry_state():
+    """'present' | 'removed' (the user deleted it; left alone) | 'missing'."""
+    if any(e.get("app_name") == MENU_APP for e in load_json(HEROIC_LIBRARY, {}).get("games", [])):
+        return "present"
+    return "removed" if settings().get("heroic_menu") == "added" else "missing"
+
+
+def ensure_menu_entry(force=False):
+    """Put save-sync in Heroic's library (once). Heroic must be closed: it holds
+    the library in memory and writes it back. An entry the user removed stays
+    removed unless forced (setup-heroic --menu). Returns a status line, or None
+    when it couldn't be done now."""
+    for f, text, mode in ((MENU_SCRIPT, menu_script(), 0o755), (MENU_ART, MENU_ART_SVG, 0o644)):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if not f.exists() or f.read_text() != text:
+            f.write_text(text)
+        f.chmod(mode)
+    state = menu_entry_state()
+    if state == "present":
+        return "save-sync is in Heroic's library"
+    if state == "removed" and not force:
+        return "save-sync was removed from Heroic's library; add it back: savesync setup-heroic --menu"
+    if not HEROIC_CFG.is_dir():
+        return "Heroic hasn't been started yet: save-sync joins its library later"
+    if heroic_running():
+        return None
+    lib = load_json(HEROIC_LIBRARY, {"games": []})
+    if HEROIC_LIBRARY.exists():
+        shutil.copyfile(HEROIC_LIBRARY, HEROIC_LIBRARY.with_suffix(".json.save-sync.bak"))
+    lib.setdefault("games", []).append({
+        "runner": "sideload", "app_name": MENU_APP, "title": "save-sync",
+        "install": {"executable": str(MENU_SCRIPT), "platform": "linux", "is_dlc": False},
+        "folder_name": str(MENU_DIR), "art_cover": f"file://{MENU_ART}", "art_square": f"file://{MENU_ART}",
+        "is_installed": True, "canRunOffline": True})
+    save_json(HEROIC_LIBRARY, lib)
+    st = settings()
+    st["heroic_menu"] = "added"
+    save_json(SETTINGS, st)
+    log("menu: added save-sync to Heroic's library")
+    return "added save-sync to Heroic's library"
+
+
+def remove_menu_entry():
+    lib = load_json(HEROIC_LIBRARY, None)
+    if lib and any(e.get("app_name") == MENU_APP for e in lib.get("games", [])):
+        lib["games"] = [e for e in lib["games"] if e.get("app_name") != MENU_APP]
+        save_json(HEROIC_LIBRARY, lib)
+    st = settings()
+    if st.pop("heroic_menu", None):
+        save_json(SETTINGS, st)
+    shutil.rmtree(MENU_DIR, ignore_errors=True)
+
+
+class NoDialog(Exception):
+    pass
+
+
+def menu_pick(title, text, items, gs, back="Back"):
+    """items: [(tag, label)]. The chosen tag, or None (Back / B / Escape). `back`
+    labels kdialog's Cancel button, which goes back a screen (Close on the first)."""
+    rc, out = dialog(["--title", title, "--menu", text + (PAD_LIST.format(back) if gs else ""),
+                      *[x for item in items for x in item], "--default", items[0][1],
+                      "--cancel-label", back], timeout=1800, gs=gs, keys="list")
+    if rc is None:
+        raise NoDialog()
+    return out if rc == 0 and out else None
+
+
+def menu_info(title, text, gs):
+    if run_dialog(["--title", title, "--msgbox", text + (PAD_HINT.format("close") if gs else "")],
+                  timeout=1800, gs=gs) is None:
+        raise NoDialog()
+
+
+def menu_text(title, text, gs):
+    STATE.mkdir(parents=True, exist_ok=True)
+    f = STATE / "menu.txt"
+    f.write_text(text)
+    try:
+        if dialog(["--title", title, "--textbox", str(f), "900", "520"], timeout=1800, gs=gs,
+                  keys="list")[0] is None:
+            raise NoDialog()
+    finally:
+        f.unlink(missing_ok=True)
+
+
+def when(t):
+    return time.strftime("%a %d %b, %H:%M", time.localtime(t)) if t else "unknown"
+
+
+def game_status(g):
+    title = g["title"]
+    pend = pending_file(title).read_text() if pending_file(title).exists() else None
+    if pend == "conflict":
+        return "save conflict: choose which save to keep"
+    if not g.get("save_paths"):
+        return "pick a save folder" if g.get("suggested_paths") else "no save folder yet"
+    if pend == "push":
+        return "waiting to upload"
+    if not (settings().get("cloud") or {}).get("mode"):
+        return "backed up on this device"
+    synced = load_json(base_file(title), {}).get("time")
+    return f"synced {when(synced)}" if synced else "not synced yet"
+
+
+def save_games(reg):
+    save_json(REGISTRY, reg)
+    cmd_gen_config(quiet=True)
+
+
+def cmd_menu(_args=None):
+    """The save-sync menu (Heroic's "save-sync" entry runs this)."""
+    global INTERACTIVE
+    INTERACTIVE = True
+    gs = gamescope_target()
+    log(f"menu: opened ({'Game Mode' if gs else 'desktop'})")
+    try:
+        menu_main(gs)
+    except NoDialog:
+        log("menu: no popup can be shown here")
+    log("menu: closed")
+
+
+def menu_main(gs):
+    cloud = (settings().get("cloud") or {}).get("mode") == "worker"
+    signed = session_status(timeout=4) if cloud else None
+    while True:
+        reg = registry()
+        games = sorted(reg.items(), key=lambda x: x[1]["title"].lower())
+        items = [(f"game:{app}", f"{g['title']}  ·  {game_status(g)}") for app, g in games]
+        if signed in ("missing", "invalid"):
+            items.append(("signin", "Sign in (saves aren't syncing)"))
+        if any(g.get("save_paths") for g in reg.values()):
+            items.append(("syncall", "Sync all games now"))
+        items.append(("close", "Close"))
+        text = ("Choose a game." if reg else
+                "No games yet. Add one with Heroic's Add Game button and launch it once.")
+        text += {"valid": f"\n\nSigned in on {DEVICE}.", "unknown": "\n\nOffline: syncing resumes when you're back.",
+                 "missing": "\n\nThis device isn't signed in: saves are only backed up here.",
+                 "invalid": "\n\nThis device was signed out: saves are only backed up here."}.get(signed, "")
+        pick = menu_pick("save-sync", text, items, gs, back="Close")
+        if pick in (None, "close"):
+            return
+        if pick == "signin":
+            menu_sign_in(gs)
+        elif pick == "syncall":
+            menu_sync([g for _, g in games], gs)
+        elif pick.startswith("game:"):
+            menu_game(pick[5:], gs)
+
+
+def menu_sign_in(gs):
+    if gs or not desktop_mode():
+        menu_info("save-sync", "Signing in needs a browser, which Game Mode can't show here.\n\n"
+                  "Switch to Desktop Mode, open save-sync in Heroic and choose Sign in.", gs)
+        return
+    start_sign_in()
+    menu_info("save-sync", "Your browser opened: sign in with Google there.\n\n"
+              "save-sync finishes on its own and shows a notification when you're signed in.", gs)
+
+
+def menu_sync(games, gs):
+    for g in games:
+        if not g.get("save_paths"):
+            continue
+        try:
+            sync_before(g)
+            if backup([g["title"]]).returncode != 0:
+                raise RuntimeError("backup failed")
+            sync_after(g, "sync from the menu")
+        except Exception as e:
+            log(f"menu: sync {g['title']}: {e!r}")
+    menu_info("save-sync", "\n".join(f"{g['title']}: {game_status(g)}" for g in games
+                                     if g.get("save_paths")), gs)
+
+
+def menu_game(app, gs):
+    cloud = (settings().get("cloud") or {}).get("mode") == "worker"
+    while True:
+        reg = registry()
+        if app not in reg:
+            return
+        g = reg[app]
+        title, paths = g["title"], g.get("save_paths", [])
+        items = []
+        if game_status(g).startswith("save conflict"):
+            items.append(("conflict", "Choose which save to keep (save conflict)"))
+        if g.get("suggested_paths"):
+            n = len(g["suggested_paths"])
+            items.append(("suggested", f"Pick a save folder ({n} suggestion{'s' * (n != 1)})"))
+        items.append(("folders", "Save folders…"))
+        if paths:
+            items += [("sync", "Sync now"), ("restore", "Go back to an older save…")]
+            if cloud:
+                items.append(("history", "History (which device saved when)"))
+        items.append(("back", "Back"))
+        text = (f"{title}: {game_status(g)}\n\nSave folders:\n  "
+                + ("\n  ".join(tilde(p) for p in paths) if paths else "none yet"))
+        pick = menu_pick(f"save-sync: {title}", text, items, gs)
+        if pick in (None, "back"):
+            return
+        try:
+            if pick == "conflict":
+                sync_before(g)                     # shows the conflict popup
+            elif pick == "suggested":
+                ask_save_folders(app, reg, gs)
+            elif pick == "folders":
+                menu_folders(app, gs)
+            elif pick == "sync":
+                menu_sync([g], gs)
+            elif pick == "restore":
+                menu_restore(g, gs)
+            elif pick == "history":
+                menu_history(g, gs)
+        except NoDialog:
+            raise
+        except Exception as e:
+            log(f"menu: {title}: {pick}: ERROR {e!r}")
+            menu_info(f"save-sync: {title}", f"That didn't work:\n{e}\n\n"
+                      "Details: ~/.local/share/save-sync/logs/savesync.log", gs)
+
+
+def menu_folders(app, gs):
+    while True:
+        reg = registry()
+        g = reg[app]
+        title, paths, sug = g["title"], g.get("save_paths", []), g.get("suggested_paths", [])
+        items = [(f"rm:{i}", f"✓ {tilde(p)}" + ("" if Path(p).exists() else "  (missing)"))
+                 for i, p in enumerate(paths)]
+        items += [(f"sug:{i}", f"? {tilde(p)}  (seen while you played)") for i, p in enumerate(sug)]
+        items += [("add", "Add a folder…"), ("watch", "Find it again: watch the next play"), ("back", "Back")]
+        text = (f"Save folders of {title}.\n\n✓ synced: choose one to stop syncing it."
+                + ("\n? suggested: choose one to decide." if sug else ""))
+        pick = menu_pick(f"save-sync: {title}", text, items, gs)
+        if pick in (None, "back"):
+            return
+        if pick.startswith("rm:"):
+            p = paths[int(pick[3:])]
+            if confirm(f"save-sync: {title}", f"Stop syncing {tilde(p)}?",
+                       "Its files stay where they are, and backups made so far are kept.",
+                       "Keep it", "Stop syncing", gs):
+                g["save_paths"] = [x for x in paths if x != p]
+                if not g["save_paths"]:
+                    g["confirmed"] = False           # nothing left: watch the next play again
+                save_games(reg)
+        elif pick.startswith("sug:"):
+            ask_save_folders(app, reg, gs, only=sug[int(pick[4:])])
+        elif pick == "add":
+            rc, out = dialog(["--title", f"save-sync: {title}: choose its save folder",
+                              "--getexistingdirectory", str(HOME)], timeout=1800, gs=gs, keys="list")
+            if rc is None:
+                raise NoDialog()
+            if rc == 0 and out and Path(out).is_dir():
+                d = str(Path(out).resolve())
+                if d in (str(HOME), str(g.get("game_dir"))):
+                    menu_info(f"save-sync: {title}", f"{tilde(d)} is too broad: choose the folder "
+                              "that holds the saves.", gs)
+                    continue
+                if d not in g.setdefault("save_paths", []):
+                    g["save_paths"].append(d)
+                g["confirmed"] = True
+                g["suggested_paths"] = [x for x in sug if x != d]
+                save_games(reg)
+        elif pick == "watch":
+            if confirm(f"save-sync: {title}", "Forget these save folders and watch the next play?",
+                       "Until you confirm a folder after that play, nothing is synced.",
+                       "Cancel", "Watch next play", gs):
+                g["save_paths"] = rule_paths(g)
+                for k in ("suggested_paths", "rejected_paths"):
+                    g.pop(k, None)
+                g["confirmed"] = False
+                save_games(reg)
+
+
+def menu_restore(g, gs):
+    title = g["title"]
+    backups = list(reversed(local_backups(title)))
+    if not backups:
+        menu_info(f"save-sync: {title}", f"No backups of {title} on this device yet.", gs)
+        return
+    items = [(b["name"], when(b["when"]) + ("  (latest)" if i == 0 else "")) for i, b in enumerate(backups)]
+    pick = menu_pick(f"save-sync: {title}",
+                     f"Backups of {title} on this device, newest first.\n\nGoing back replaces the "
+                     "saves here and, once synced, on your other devices. The current saves are kept "
+                     "in ~/.local/share/save-sync/conflicts/ first.", items + [("back", "Back")], gs)
+    if pick in (None, "back"):
+        return
+    b = next(b for b in backups if b["name"] == pick)
+    if confirm(f"save-sync: {title}", f"Go back to the save from {when(b['when'])}?",
+               "This replaces the saves here and, once synced, on your other devices. The current "
+               "saves are kept in ~/.local/share/save-sync/conflicts/ first.", "Cancel", "Go back", gs):
+        dest = restore_backup(g, pick)
+        menu_info(f"save-sync: {title}", f"Done: {title} is back to {when(b['when'])}.\n\n"
+                  f"The saves it replaced are in\n{tilde(dest)}", gs)
+
+
+def menu_history(g, gs):
+    title = g["title"]
+    try:
+        events, head = cloud_history(title, 40)
+    except (Offline, SystemExit) as e:
+        menu_info(f"save-sync: {title}", f"Can't reach the cloud right now ({e}).", gs)
+        return
+    chose = {"cloud": "used the cloud save", "local": "kept this device's save", "later": "decided later"}
+    lines = []
+    for e in reversed(events):
+        k = e.get("kind")
+        if k == "push":
+            what = f"uploaded ({e.get('why')})"
+        elif k == "pull":
+            what = f"downloaded the save from {e.get('from_device')}"
+        elif k == "conflict":
+            what = (f"save conflict {e.get('when')}: {chose.get(e.get('choice'), e.get('choice'))}"
+                    + (" (the popup couldn't be shown)" if e.get("how") == "unavailable" else ""))
+        else:
+            what = k
+        lines.append(f"{when(e.get('time'))}   {e.get('device', '?')}   {what}")
+    top = (f"The cloud has the save from {head.get('device')} ({when(head.get('save_time') or head.get('time'))}).\n\n"
+           if head else "Nothing in the cloud yet.\n\n")
+    menu_text(f"save-sync: {title}: history", top + ("\n".join(lines) or "No events yet."), gs)
 
 
 # ------------------------------------------------------------ doctor
@@ -1813,6 +2612,9 @@ def cmd_doctor(_args=None):
     d = load_json(HEROIC_CONFIG, {}).get("defaultSettings", {})
     check(d.get("beforeLaunchScriptPath") == str(HOOK) and d.get("afterLaunchScriptPath") == str(HOOK),
           "Heroic global Before/After scripts point at save-sync", "quit Heroic, savesync setup-heroic")
+    st = menu_entry_state()
+    check(st != "missing", "save-sync menu in Heroic's library" + (" (you removed it)" if st == "removed" else ""),
+          "quit Heroic, savesync setup-heroic")
     for f in sorted(HEROIC_GAMESCONFIG.glob("*.json")):
         for app, s in load_json(f, {}).items():
             if isinstance(s, dict):
@@ -1825,7 +2627,9 @@ def cmd_doctor(_args=None):
         paths = g.get("save_paths", [])
         check(bool(paths) and all(Path(p).exists() for p in paths),
               f"{g['title']}: {len(paths)} save folder(s)", f"savesync paths '{app}' --set <folder>")
-        if not g.get("confirmed"):
+        if g.get("suggested_paths"):
+            print(f"  [ ] {g['title']}: suggested save folders to decide on (save-sync menu in Heroic)")
+        elif not g.get("confirmed"):
             print(f"  [ ] {g['title']}: save folders not confirmed yet (savesync paths '{app}' --confirm)")
     for _f, _d, sc in heroic_shortcuts():
         check(STEAM_WRAP in sc.get("LaunchOptions", ""),
@@ -1842,7 +2646,7 @@ COMMANDS = {
     "setup-heroic": cmd_setup_heroic, "unhook-heroic": cmd_unhook_heroic,
     "gen-config": cmd_gen_config, "doctor": cmd_doctor, "hook": cmd_hook, "sync": cmd_sync,
     "login": cmd_login, "devices": cmd_devices, "status": cmd_status, "update": cmd_update,
-    "resolve": cmd_resolve, "history": cmd_history,
+    "resolve": cmd_resolve, "history": cmd_history, "restore": cmd_restore, "menu": cmd_menu,
     "setup-steam": cmd_setup_steam, "heroic-exited": cmd_heroic_exited, "wait-hooks": cmd_heroic_exited,
     "steam-wrap": cmd_steam_wrap,
 }
